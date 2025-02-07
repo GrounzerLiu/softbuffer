@@ -123,11 +123,17 @@ pub struct BufferImpl<'a, D: ?Sized, W> {
 // TODO: Move to NativeWindowBufferLockGuard?
 unsafe impl<'a, D, W> Send for BufferImpl<'a, D, W> {}
 
+pub fn bytes<'a>(native_window_buffer:&'a mut NativeWindowBufferLockGuard) -> Option<&'a mut [u8]> {
+    let num_pixels = native_window_buffer.stride() * native_window_buffer.height();
+    let num_bytes = num_pixels * native_window_buffer.format().bytes_per_pixel()?;
+    Some(unsafe { std::slice::from_raw_parts_mut(native_window_buffer.bits().cast(), num_bytes) })
+}
+
 pub fn lines<'a>(native_window_buffer:&'a mut NativeWindowBufferLockGuard) -> Option<impl Iterator<Item = &'a mut [u8]>> {
     let bpp = native_window_buffer.format().bytes_per_pixel()?;
     let scanline_bytes = bpp * native_window_buffer.stride();
     let width_bytes = bpp * native_window_buffer.width();
-    let bytes = native_window_buffer.bytes()?;
+    let bytes = bytes(native_window_buffer)?;
 
     Some(
         bytes
