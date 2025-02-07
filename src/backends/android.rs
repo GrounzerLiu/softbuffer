@@ -1,6 +1,7 @@
 //! Implementation of software buffering for Android.
 
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::num::{NonZeroI32, NonZeroU32};
 
 use ndk::{
@@ -122,6 +123,19 @@ pub struct BufferImpl<'a, D: ?Sized, W> {
 // TODO: Move to NativeWindowBufferLockGuard?
 unsafe impl<'a, D, W> Send for BufferImpl<'a, D, W> {}
 
+pub fn lines<'a>(native_window_buffer:&'a mut NativeWindowBufferLockGuard) -> Option<impl Iterator<Item = &'a mut [u8]>> {
+    let bpp = native_window_buffer.format().bytes_per_pixel()?;
+    let scanline_bytes = bpp * native_window_buffer.stride();
+    let width_bytes = bpp * native_window_buffer.width();
+    let bytes = native_window_buffer.bytes()?;
+
+    Some(
+        bytes
+            .chunks_exact_mut(scanline_bytes)
+            .map(move |scanline| &mut scanline[..width_bytes]),
+    )
+}
+
 impl<'a, D: HasDisplayHandle, W: HasWindowHandle> BufferInterface for BufferImpl<'a, D, W> {
     #[inline]
     fn pixels(&self) -> &[u32] {
@@ -141,9 +155,8 @@ impl<'a, D: HasDisplayHandle, W: HasWindowHandle> BufferInterface for BufferImpl
     // TODO: This function is pretty slow this way
     fn present(mut self) -> Result<(), SoftBufferError> {
         let input_lines = self.buffer.chunks(self.native_window_buffer.width());
-        for (output, input) in self
-            .native_window_buffer
-            .lines()
+        for (output, input) in
+            lines(&mut self.native_window_buffer)
             // Unreachable as we checked before that this is a valid, mappable format
             .unwrap()
             .zip(input_lines)
@@ -151,14 +164,18 @@ impl<'a, D: HasDisplayHandle, W: HasWindowHandle> BufferInterface for BufferImpl
             // .lines() removed the stride
             assert_eq!(output.len(), input.len() * 4);
 
-            for (i, pixel) in input.iter().enumerate() {
-                // Swizzle colors from RGBX to BGR
-                let [b, g, r, _] = pixel.to_le_bytes();
-                output[i * 4].write(b);
-                output[i * 4 + 1].write(g);
-                output[i * 4 + 2].write(r);
-                // TODO alpha?
-            }
+            // use bytemuck to write the buffer
+            let output:&mut [u32] = bytemuck::cast_slice_mut(output);
+            output.copy_from_slice(bytemuck::cast_slice(input));
+
+            // for (i, pixel) in input.iter().enumerate() {
+            //     // Swizzle colors from RGBX to BGR
+            //     let [b, g, r, _] = pixel.to_le_bytes();
+            //     output[i * 4].write(b);
+            //     output[i * 4 + 1].write(g);
+            //     output[i * 4 + 2].write(r);
+            //     // TODO alpha?
+            // }
         }
         Ok(())
     }
