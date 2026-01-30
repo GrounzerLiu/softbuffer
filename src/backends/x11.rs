@@ -7,7 +7,7 @@
 
 use crate::backend_interface::*;
 use crate::error::{InitError, SwResultExt};
-use crate::{Rect, SoftBufferError};
+use crate::{util, Pixel, Rect, SoftBufferError};
 use raw_window_handle::{
     HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle, XcbDisplayHandle,
     XcbWindowHandle,
@@ -21,7 +21,8 @@ use std::{
     collections::HashSet,
     fmt,
     fs::File,
-    io, mem,
+    io,
+    mem::{self, size_of},
     num::{NonZeroU16, NonZeroU32},
     ptr::{null_mut, NonNull},
     slice,
@@ -36,6 +37,7 @@ use x11rb::protocol::shm::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _, ImageOrder, VisualClass, Visualid};
 use x11rb::xcb_ffi::XCBConnection;
 
+#[derive(Debug)]
 pub struct X11DisplayImpl<D: ?Sized> {
     /// The handle to the XCB connection.
     connection: Option<XCBConnection>,
@@ -125,6 +127,7 @@ impl<D: ?Sized> X11DisplayImpl<D> {
 }
 
 /// The handle to an X11 drawing context.
+#[derive(Debug)]
 pub struct X11Impl<D: ?Sized, W: ?Sized> {
     /// X display this window belongs to.
     display: Arc<X11DisplayImpl<D>>,
@@ -155,14 +158,16 @@ pub struct X11Impl<D: ?Sized, W: ?Sized> {
 }
 
 /// The buffer that is being drawn to.
+#[derive(Debug)]
 enum Buffer {
     /// A buffer implemented using shared memory to prevent unnecessary copying.
     Shm(ShmBuffer),
 
     /// A normal buffer that we send over the wire.
-    Wire(Vec<u32>),
+    Wire(util::PixelBuffer),
 }
 
+#[derive(Debug)]
 struct ShmBuffer {
     /// The shared memory segment, paired with its ID.
     seg: Option<(ShmSegment, shm::Seg)>,
@@ -185,7 +190,7 @@ struct ShmBuffer {
 impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> for X11Impl<D, W> {
     type Context = Arc<X11DisplayImpl<D>>;
     type Buffer<'a>
-        = BufferImpl<'a, D, W>
+        = BufferImpl<'a>
     where
         Self: 'a;
 
@@ -285,7 +290,7 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
             })
         } else {
             // SHM is not available.
-            Buffer::Wire(Vec::new())
+            Buffer::Wire(util::PixelBuffer(Vec::new()))
         };
 
         Ok(Self {
@@ -323,10 +328,13 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
             height,
         }))?;
 
+        let byte_stride = width.get() * 4;
+        let num_bytes = byte_stride as usize * height.get() as usize;
+
         if self.size != Some((width, height)) {
             self.buffer_presented = false;
             self.buffer
-                .resize(self.display.connection(), width.get(), height.get())
+                .resize(self.display.connection(), num_bytes)
                 .swbuf_err("Failed to resize X11 buffer")?;
 
             // We successfully resized the buffer.
@@ -336,17 +344,25 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
         Ok(())
     }
 
-    fn buffer_mut(&mut self) -> Result<BufferImpl<'_, D, W>, SoftBufferError> {
+    fn buffer_mut(&mut self) -> Result<BufferImpl<'_>, SoftBufferError> {
         tracing::trace!("buffer_mut: window={:X}", self.window);
 
         // Finish waiting on the previous `shm::PutImage` request, if any.
         self.buffer.finish_wait(self.display.connection())?;
 
         // We can now safely call `buffer_mut` on the buffer.
-        Ok(BufferImpl(self))
+        Ok(BufferImpl {
+            connection: self.display.connection(),
+            window: self.window,
+            gc: self.gc,
+            depth: self.depth,
+            buffer: &mut self.buffer,
+            buffer_presented: &mut self.buffer_presented,
+            size: self.size,
+        })
     }
 
-    fn fetch(&mut self) -> Result<Vec<u32>, SoftBufferError> {
+    fn fetch(&mut self) -> Result<Vec<Pixel>, SoftBufferError> {
         tracing::trace!("fetch: window={:X}", self.window);
 
         let (width, height) = self
@@ -371,8 +387,15 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
             .swbuf_err("Failed to fetch image from window")?;
 
         if reply.depth == self.depth && reply.visual == self.visual_id {
-            let mut out = vec![0u32; reply.data.len() / 4];
-            bytemuck::cast_slice_mut::<u32, u8>(&mut out).copy_from_slice(&reply.data);
+            let mut out = vec![Pixel::default(); reply.data.len() / size_of::<Pixel>()];
+            // SAFETY: `Pixel` can be re-interpreted as `[u8; 4]`.
+            let out_u8s = unsafe {
+                slice::from_raw_parts_mut(
+                    out.as_mut_ptr().cast::<u8>(),
+                    out.len() * size_of::<Pixel>(),
+                )
+            };
+            out_u8s.copy_from_slice(&reply.data);
             Ok(out)
         } else {
             Err(SoftBufferError::PlatformError(
@@ -383,25 +406,39 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
     }
 }
 
-pub struct BufferImpl<'a, D: ?Sized, W: ?Sized>(&'a mut X11Impl<D, W>);
+#[derive(Debug)]
+pub struct BufferImpl<'a> {
+    // Various fields that reference data in `X11Impl`.
+    connection: &'a XCBConnection,
+    window: xproto::Window,
+    gc: xproto::Gcontext,
+    depth: u8,
+    buffer: &'a mut Buffer,
+    buffer_presented: &'a mut bool,
+    size: Option<(NonZeroU16, NonZeroU16)>,
+}
 
-impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle + ?Sized> BufferInterface
-    for BufferImpl<'_, D, W>
-{
-    #[inline]
-    fn pixels(&self) -> &[u32] {
-        // SAFETY: We called `finish_wait` on the buffer, so it is safe to call `buffer()`.
-        unsafe { self.0.buffer.buffer() }
+impl BufferInterface for BufferImpl<'_> {
+    fn byte_stride(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.width().get() * 4).unwrap()
+    }
+
+    fn width(&self) -> NonZeroU32 {
+        self.size.unwrap().0.into()
+    }
+
+    fn height(&self) -> NonZeroU32 {
+        self.size.unwrap().1.into()
     }
 
     #[inline]
-    fn pixels_mut(&mut self) -> &mut [u32] {
+    fn pixels_mut(&mut self) -> &mut [Pixel] {
         // SAFETY: We called `finish_wait` on the buffer, so it is safe to call `buffer_mut`.
-        unsafe { self.0.buffer.buffer_mut() }
+        unsafe { self.buffer.buffer_mut() }
     }
 
     fn age(&self) -> u8 {
-        if self.0.buffer_presented {
+        if *self.buffer_presented {
             1
         } else {
             0
@@ -410,32 +447,37 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle + ?Sized> BufferInterface
 
     /// Push the buffer to the window.
     fn present_with_damage(self, damage: &[Rect]) -> Result<(), SoftBufferError> {
-        let imp = self.0;
-
-        let (surface_width, surface_height) = imp
+        let (surface_width, surface_height) = self
             .size
             .expect("Must set size of surface before calling `present_with_damage()`");
 
-        tracing::trace!("present: window={:X}", imp.window);
+        tracing::trace!("present: window={:X}", self.window);
 
-        match imp.buffer {
+        match self.buffer {
             Buffer::Wire(ref wire) => {
                 // This is a suboptimal strategy, raise a stink in the debug logs.
                 tracing::debug!("Falling back to non-SHM method for window drawing.");
 
-                imp.display
-                    .connection()
+                // SAFETY: `Pixel` can be re-interpreted as `[u8; 4]`.
+                let data = unsafe {
+                    slice::from_raw_parts(
+                        wire.as_ptr().cast::<u8>(),
+                        wire.len() * size_of::<Pixel>(),
+                    )
+                };
+
+                self.connection
                     .put_image(
                         xproto::ImageFormat::Z_PIXMAP,
-                        imp.window,
-                        imp.gc,
+                        self.window,
+                        self.gc,
                         surface_width.get(),
                         surface_height.get(),
                         0,
                         0,
                         0,
-                        imp.depth,
-                        bytemuck::cast_slice(wire),
+                        self.depth,
+                        data,
                     )
                     .map(|c| c.ignore_error())
                     .push_err()
@@ -450,23 +492,22 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle + ?Sized> BufferInterface
                     damage
                         .iter()
                         .try_for_each(|rect| {
-                            let (src_x, src_y, dst_x, dst_y, width, height) = (|| {
-                                Some((
-                                    u16::try_from(rect.x).ok()?,
-                                    u16::try_from(rect.y).ok()?,
-                                    i16::try_from(rect.x).ok()?,
-                                    i16::try_from(rect.y).ok()?,
-                                    u16::try_from(rect.width.get()).ok()?,
-                                    u16::try_from(rect.height.get()).ok()?,
-                                ))
-                            })(
-                            )
-                            .ok_or(SoftBufferError::DamageOutOfRange { rect: *rect })?;
-                            imp.display
-                                .connection()
+                            let rect = util::clamp_rect(
+                                *rect,
+                                surface_width.into(),
+                                surface_height.into(),
+                            );
+                            let src_x = util::to_u16_saturating(rect.x);
+                            let src_y = util::to_u16_saturating(rect.y);
+                            let dst_x = util::to_i16_saturating(rect.x);
+                            let dst_y = util::to_i16_saturating(rect.y);
+                            let width = util::to_u16_saturating(rect.width.get());
+                            let height = util::to_u16_saturating(rect.height.get());
+
+                            self.connection
                                 .shm_put_image(
-                                    imp.window,
-                                    imp.gc,
+                                    self.window,
+                                    self.gc,
                                     surface_width.get(),
                                     surface_height.get(),
                                     src_x,
@@ -475,7 +516,7 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle + ?Sized> BufferInterface
                                     height,
                                     dst_x,
                                     dst_y,
-                                    imp.depth,
+                                    self.depth,
                                     xproto::ImageFormat::Z_PIXMAP.into(),
                                     false,
                                     segment_id,
@@ -487,44 +528,26 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle + ?Sized> BufferInterface
                         })
                         .and_then(|()| {
                             // Send a short request to act as a notification for when the X server is done processing the image.
-                            shm.begin_wait(imp.display.connection())
+                            shm.begin_wait(self.connection)
                                 .swbuf_err("Failed to draw image to window")
                         })?;
                 }
             }
         }
 
-        imp.buffer_presented = true;
+        *self.buffer_presented = true;
 
         Ok(())
-    }
-
-    fn present(self) -> Result<(), SoftBufferError> {
-        let (width, height) = self
-            .0
-            .size
-            .expect("Must set size of surface before calling `present()`");
-        self.present_with_damage(&[Rect {
-            x: 0,
-            y: 0,
-            width: width.into(),
-            height: height.into(),
-        }])
     }
 }
 
 impl Buffer {
-    /// Resize the buffer to the given size.
-    fn resize(
-        &mut self,
-        conn: &impl Connection,
-        width: u16,
-        height: u16,
-    ) -> Result<(), PushBufferError> {
+    /// Resize the buffer to the given number of bytes.
+    fn resize(&mut self, conn: &impl Connection, num_bytes: usize) -> Result<(), PushBufferError> {
         match self {
-            Buffer::Shm(ref mut shm) => shm.alloc_segment(conn, total_len(width, height)),
+            Buffer::Shm(ref mut shm) => shm.alloc_segment(conn, num_bytes),
             Buffer::Wire(wire) => {
-                wire.resize(total_len(width, height) / 4, 0);
+                wire.resize(num_bytes / size_of::<Pixel>(), Pixel::default());
                 Ok(())
             }
         }
@@ -540,26 +563,13 @@ impl Buffer {
         Ok(())
     }
 
-    /// Get a reference to the buffer.
-    ///
-    /// # Safety
-    ///
-    /// `finish_wait()` must be called in between `shm::PutImage` requests and this function.
-    #[inline]
-    unsafe fn buffer(&self) -> &[u32] {
-        match self {
-            Buffer::Shm(ref shm) => unsafe { shm.as_ref() },
-            Buffer::Wire(wire) => wire,
-        }
-    }
-
     /// Get a mutable reference to the buffer.
     ///
     /// # Safety
     ///
     /// `finish_wait()` must be called in between `shm::PutImage` requests and this function.
     #[inline]
-    unsafe fn buffer_mut(&mut self) -> &mut [u32] {
+    unsafe fn buffer_mut(&mut self) -> &mut [Pixel] {
         match self {
             Buffer::Shm(ref mut shm) => unsafe { shm.as_mut() },
             Buffer::Wire(wire) => wire,
@@ -594,40 +604,26 @@ impl ShmBuffer {
         Ok(())
     }
 
-    /// Get the SHM buffer as a reference.
-    ///
-    /// # Safety
-    ///
-    /// `finish_wait()` must be called before this function is.
-    #[inline]
-    unsafe fn as_ref(&self) -> &[u32] {
-        match self.seg.as_ref() {
-            Some((seg, _)) => {
-                let buffer_size = seg.buffer_size();
-
-                // SAFETY: No other code should be able to access the segment.
-                bytemuck::cast_slice(unsafe { &seg.as_ref()[..buffer_size] })
-            }
-            None => {
-                // Nothing has been allocated yet.
-                &[]
-            }
-        }
-    }
-
     /// Get the SHM buffer as a mutable reference.
     ///
     /// # Safety
     ///
     /// `finish_wait()` must be called before this function is.
     #[inline]
-    unsafe fn as_mut(&mut self) -> &mut [u32] {
+    unsafe fn as_mut(&mut self) -> &mut [Pixel] {
         match self.seg.as_mut() {
             Some((seg, _)) => {
                 let buffer_size = seg.buffer_size();
 
                 // SAFETY: No other code should be able to access the segment.
-                bytemuck::cast_slice_mut(unsafe { &mut seg.as_mut()[..buffer_size] })
+                let segment = unsafe { &mut seg.as_mut()[..buffer_size] };
+
+                let ptr = segment.as_mut_ptr().cast::<Pixel>();
+                let len = segment.len() / size_of::<Pixel>();
+                debug_assert_eq!(segment.len() % size_of::<Pixel>(), 0);
+                // SAFETY: The segment buffer is a multiple of `Pixel`, and we assume that the
+                // memmap allocation is aligned to at least a multiple of 4 bytes.
+                unsafe { slice::from_raw_parts_mut(ptr, len) }
             }
             None => {
                 // Nothing has been allocated yet.
@@ -681,6 +677,7 @@ impl ShmBuffer {
     }
 }
 
+#[derive(Debug)]
 struct ShmSegment {
     id: File,
     ptr: NonNull<i8>,
@@ -725,15 +722,6 @@ impl ShmSegment {
             size,
             buffer_size,
         })
-    }
-
-    /// Get this shared memory segment as a reference.
-    ///
-    /// # Safety
-    ///
-    /// One must ensure that no other processes are writing to this memory.
-    unsafe fn as_ref(&self) -> &[i8] {
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.size) }
     }
 
     /// Get this shared memory segment as a mutable reference.
@@ -787,7 +775,10 @@ impl<D: ?Sized> Drop for X11DisplayImpl<D> {
 impl<D: ?Sized, W: ?Sized> Drop for X11Impl<D, W> {
     fn drop(&mut self) {
         // If we used SHM, make sure it's detached from the server.
-        if let Buffer::Shm(mut shm) = mem::replace(&mut self.buffer, Buffer::Wire(Vec::new())) {
+        if let Buffer::Shm(mut shm) = mem::replace(
+            &mut self.buffer,
+            Buffer::Wire(util::PixelBuffer(Vec::new())),
+        ) {
             // If we were in the middle of processing a buffer, wait for it to finish.
             shm.finish_wait(self.display.connection()).ok();
 
@@ -810,26 +801,26 @@ impl<D: ?Sized, W: ?Sized> Drop for X11Impl<D, W> {
 
 /// Create a shared memory identifier.
 fn create_shm_id() -> io::Result<OwnedFd> {
-    use posix_shm::{Mode, ShmOFlags};
+    use posix_shm::{Mode, OFlags};
 
     let mut rng = fastrand::Rng::new();
-    let mut name = String::with_capacity(23);
+    let mut name = String::with_capacity(24);
 
     // Only try four times; the chances of a collision on this space is astronomically low, so if
     // we miss four times in a row we're probably under attack.
     for i in 0..4 {
         name.clear();
-        name.push_str("softbuffer-x11-");
+        name.push_str("/softbuffer-x11-");
         name.extend(std::iter::repeat_with(|| rng.alphanumeric()).take(7));
 
         // Try to create the shared memory segment.
-        match posix_shm::shm_open(
+        match posix_shm::open(
             &name,
-            ShmOFlags::RDWR | ShmOFlags::CREATE | ShmOFlags::EXCL,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
             Mode::RWXU,
         ) {
             Ok(id) => {
-                posix_shm::shm_unlink(&name).ok();
+                posix_shm::unlink(&name).ok();
                 return Ok(id);
             }
 
@@ -991,16 +982,4 @@ impl<T, E: Into<PushBufferError>> PushResultExt<T, E> for Result<T, E> {
     fn push_err(self) -> Result<T, PushBufferError> {
         self.map_err(Into::into)
     }
-}
-
-/// Get the length that a slice needs to be to hold a buffer of the given dimensions.
-#[inline(always)]
-fn total_len(width: u16, height: u16) -> usize {
-    let width: usize = width.into();
-    let height: usize = height.into();
-
-    width
-        .checked_mul(height)
-        .and_then(|len| len.checked_mul(4))
-        .unwrap_or_else(|| panic!("Dimensions are too large: ({} x {})", width, height))
 }

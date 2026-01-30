@@ -15,6 +15,8 @@ use wayland_client::{
 };
 
 use super::State;
+use crate::util;
+use crate::Pixel;
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn create_memfile() -> File {
@@ -30,27 +32,27 @@ fn create_memfile() -> File {
 
 #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn create_memfile() -> File {
-    use rustix::{fs::Mode, io::Errno, shm::ShmOFlags};
+    use rustix::{fs::Mode, io::Errno, shm::OFlags};
     use std::iter;
 
     // Use a cached RNG to avoid hammering the thread local.
     let mut rng = fastrand::Rng::new();
 
     for _ in 0..=4 {
-        let mut name = String::from("softbuffer-");
+        let mut name = String::from("/softbuffer-");
         name.extend(iter::repeat_with(|| rng.alphanumeric()).take(7));
         name.push('\0');
 
         let name = unsafe { CStr::from_bytes_with_nul_unchecked(name.as_bytes()) };
         // `CLOEXEC` is implied with `shm_open`
-        let fd = rustix::shm::shm_open(
+        let fd = rustix::shm::open(
             name,
-            ShmOFlags::RDWR | ShmOFlags::CREATE | ShmOFlags::EXCL,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
             Mode::RWXU,
         );
         if !matches!(fd, Err(Errno::EXIST)) {
             let fd = fd.expect("Failed to create POSIX shm to store buffer.");
-            let _ = rustix::shm::shm_unlink(name);
+            let _ = rustix::shm::unlink(name);
             return File::from(fd);
         }
     }
@@ -67,6 +69,7 @@ unsafe fn map_file(file: &File) -> MmapMut {
     unsafe { MmapMut::map_mut(file.as_raw_fd()).expect("Failed to map shared memory") }
 }
 
+#[derive(Debug)]
 pub(super) struct WaylandBuffer {
     qh: QueueHandle<State>,
     tempfile: File,
@@ -74,8 +77,8 @@ pub(super) struct WaylandBuffer {
     pool: wl_shm_pool::WlShmPool,
     pool_size: i32,
     buffer: wl_buffer::WlBuffer,
-    width: i32,
-    height: i32,
+    pub width: i32,
+    pub height: i32,
     released: Arc<AtomicBool>,
     pub age: u8,
 }
@@ -97,7 +100,9 @@ impl WaylandBuffer {
             0,
             width,
             height,
-            width * 4,
+            util::byte_stride(width as u32) as i32,
+            // This is documented as `0xXXRRGGBB` on a little-endian machine, which means a byte
+            // order of `[B, G, R, X]`.
             wl_shm::Format::Xrgb8888,
             qh,
             released.clone(),
@@ -137,7 +142,7 @@ impl WaylandBuffer {
                 0,
                 width,
                 height,
-                width * 4,
+                util::byte_stride(width as u32) as i32,
                 wl_shm::Format::Xrgb8888,
                 &self.qh,
                 self.released.clone(),
@@ -157,11 +162,16 @@ impl WaylandBuffer {
     }
 
     fn len(&self) -> usize {
-        self.width as usize * self.height as usize
+        util::byte_stride(self.width as u32) as usize * self.height as usize / 4
     }
 
-    pub unsafe fn mapped_mut(&mut self) -> &mut [u32] {
-        unsafe { slice::from_raw_parts_mut(self.map.as_mut_ptr() as *mut u32, self.len()) }
+    #[inline]
+    pub fn mapped_mut(&mut self) -> &mut [Pixel] {
+        debug_assert!(self.len() * 4 <= self.map.len());
+        // SAFETY: We're casting a `&mut [u8]` to `&mut [Pixel]`, and we assume that the memmap
+        // allocation s aligned to at least a multiple of 4 bytes, and that the size of the
+        // region is large enough.
+        unsafe { slice::from_raw_parts_mut(self.map.as_mut_ptr() as *mut Pixel, self.len()) }
     }
 }
 

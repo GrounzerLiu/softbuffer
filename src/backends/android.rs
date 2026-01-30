@@ -1,7 +1,6 @@
 //! Implementation of software buffering for Android.
 
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
 use std::num::{NonZeroI32, NonZeroU32};
 
 use ndk::{
@@ -13,9 +12,10 @@ use raw_window_handle::AndroidNdkWindowHandle;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 
 use crate::error::InitError;
-use crate::{BufferInterface, Rect, SoftBufferError, SurfaceInterface};
+use crate::{util, BufferInterface, Pixel, Rect, SoftBufferError, SurfaceInterface};
 
 /// The handle to a window for software buffering.
+#[derive(Debug)]
 pub struct AndroidImpl<D, W> {
     native_window: NativeWindow,
     window: W,
@@ -25,7 +25,7 @@ pub struct AndroidImpl<D, W> {
 impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for AndroidImpl<D, W> {
     type Context = D;
     type Buffer<'a>
-        = BufferImpl<'a, D, W>
+        = BufferImpl<'a>
     where
         Self: 'a;
 
@@ -76,7 +76,7 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for Android
             })
     }
 
-    fn buffer_mut(&mut self) -> Result<BufferImpl<'_, D, W>, SoftBufferError> {
+    fn buffer_mut(&mut self) -> Result<BufferImpl<'_>, SoftBufferError> {
         let native_window_buffer = self.native_window.lock(None).map_err(|err| {
             SoftBufferError::PlatformError(
                 Some("Failed to lock ANativeWindow".to_owned()),
@@ -99,57 +99,45 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for Android
             ));
         }
 
-        let buffer = vec![0; native_window_buffer.width() * native_window_buffer.height()];
+        let buffer =
+            vec![Pixel::default(); native_window_buffer.stride() * native_window_buffer.height()];
 
         Ok(BufferImpl {
             native_window_buffer,
-            buffer,
-            marker: PhantomData,
+            buffer: util::PixelBuffer(buffer),
         })
     }
 
     /// Fetch the buffer from the window.
-    fn fetch(&mut self) -> Result<Vec<u32>, SoftBufferError> {
+    fn fetch(&mut self) -> Result<Vec<Pixel>, SoftBufferError> {
         Err(SoftBufferError::Unimplemented)
     }
 }
 
-pub struct BufferImpl<'a, D: ?Sized, W> {
+#[derive(Debug)]
+pub struct BufferImpl<'a> {
     native_window_buffer: NativeWindowBufferLockGuard<'a>,
-    buffer: Vec<u32>,
-    marker: PhantomData<(&'a D, &'a W)>,
+    buffer: util::PixelBuffer,
 }
 
 // TODO: Move to NativeWindowBufferLockGuard?
-unsafe impl<'a, D, W> Send for BufferImpl<'a, D, W> {}
+unsafe impl Send for BufferImpl<'_> {}
 
-pub fn bytes<'a>(native_window_buffer:&'a mut NativeWindowBufferLockGuard) -> Option<&'a mut [u8]> {
-    let num_pixels = native_window_buffer.stride() * native_window_buffer.height();
-    let num_bytes = num_pixels * native_window_buffer.format().bytes_per_pixel()?;
-    Some(unsafe { std::slice::from_raw_parts_mut(native_window_buffer.bits().cast(), num_bytes) })
-}
+impl BufferInterface for BufferImpl<'_> {
+    fn byte_stride(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.native_window_buffer.stride() as u32 * 4).unwrap()
+    }
 
-pub fn lines<'a>(native_window_buffer:&'a mut NativeWindowBufferLockGuard) -> Option<impl Iterator<Item = &'a mut [u8]>> {
-    let bpp = native_window_buffer.format().bytes_per_pixel()?;
-    let scanline_bytes = bpp * native_window_buffer.stride();
-    let width_bytes = bpp * native_window_buffer.width();
-    let bytes = bytes(native_window_buffer)?;
+    fn width(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.native_window_buffer.width() as u32).unwrap()
+    }
 
-    Some(
-        bytes
-            .chunks_exact_mut(scanline_bytes)
-            .map(move |scanline| &mut scanline[..width_bytes]),
-    )
-}
-
-impl<'a, D: HasDisplayHandle, W: HasWindowHandle> BufferInterface for BufferImpl<'a, D, W> {
-    #[inline]
-    fn pixels(&self) -> &[u32] {
-        &self.buffer
+    fn height(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.native_window_buffer.height() as u32).unwrap()
     }
 
     #[inline]
-    fn pixels_mut(&mut self) -> &mut [u32] {
+    fn pixels_mut(&mut self) -> &mut [Pixel] {
         &mut self.buffer
     }
 
@@ -159,37 +147,30 @@ impl<'a, D: HasDisplayHandle, W: HasWindowHandle> BufferInterface for BufferImpl
     }
 
     // TODO: This function is pretty slow this way
-    fn present(mut self) -> Result<(), SoftBufferError> {
-        let input_lines = self.buffer.chunks(self.native_window_buffer.width());
-        for (output, input) in
-            lines(&mut self.native_window_buffer)
-            // Unreachable as we checked before that this is a valid, mappable format
-            .unwrap()
-            .zip(input_lines)
-        {
-            // .lines() removed the stride
-            assert_eq!(output.len(), input.len() * 4);
-
-            // use bytemuck to write the buffer
-            let output:&mut [u32] = bytemuck::cast_slice_mut(output);
-            output.copy_from_slice(bytemuck::cast_slice(input));
-
-            // for (i, pixel) in input.iter().enumerate() {
-            //     // Swizzle colors from RGBX to BGR
-            //     let [b, g, r, _] = pixel.to_le_bytes();
-            //     output[i * 4].write(b);
-            //     output[i * 4 + 1].write(g);
-            //     output[i * 4 + 2].write(r);
-            //     // TODO alpha?
-            // }
-        }
-        Ok(())
-    }
-
-    fn present_with_damage(self, _damage: &[Rect]) -> Result<(), SoftBufferError> {
+    fn present_with_damage(mut self, damage: &[Rect]) -> Result<(), SoftBufferError> {
         // TODO: Android requires the damage rect _at lock time_
         // Since we're faking the backing buffer _anyway_, we could even fake the surface lock
         // and lock it here (if it doesn't influence timings).
-        self.present()
+        //
+        // Android seems to do this because the region can be expanded by the
+        // system, requesting the user to actually redraw a larger region.
+        // It's unclear if/when this is used, or if corruption/artifacts occur
+        // when the enlarged damage region is not re-rendered?
+        let _ = damage;
+
+        // Unreachable as we checked before that this is a valid, mappable format
+        let native_buffer = self.native_window_buffer.bytes().unwrap();
+
+        // Write RGB(A) to the output.
+        // TODO: Use `slice::write_copy_of_slice` once stable and in MSRV.
+        // TODO(madsmtm): Verify that this compiles down to an efficient copy.
+        for (pixel, output) in self.buffer.iter().zip(native_buffer.chunks_mut(4)) {
+            output[0].write(pixel.r);
+            output[1].write(pixel.g);
+            output[2].write(pixel.b);
+            output[3].write(pixel.a);
+        }
+
+        Ok(())
     }
 }

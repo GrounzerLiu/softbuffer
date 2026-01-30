@@ -3,12 +3,12 @@
 //! This module converts the input buffer into a bitmap and then stretches it to the window.
 
 use crate::backend_interface::*;
-use crate::{Rect, SoftBufferError};
+use crate::{util, Pixel, Rect, SoftBufferError};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 
 use std::io;
 use std::marker::PhantomData;
-use std::mem;
+use std::mem::size_of;
 use std::num::{NonZeroI32, NonZeroU32};
 use std::ptr::{self, NonNull};
 use std::slice;
@@ -25,10 +25,11 @@ const ZERO_QUAD: Gdi::RGBQUAD = Gdi::RGBQUAD {
     rgbReserved: 0,
 };
 
+#[derive(Debug)]
 struct Buffer {
     dc: Gdi::HDC,
     bitmap: Gdi::HBITMAP,
-    pixels: NonNull<u32>,
+    pixels: NonNull<Pixel>,
     width: NonZeroI32,
     height: NonZeroI32,
     presented: bool,
@@ -54,7 +55,7 @@ impl Buffer {
         // Create a new bitmap info struct.
         let bitmap_info = BitmapInfo {
             bmi_header: Gdi::BITMAPINFOHEADER {
-                biSize: mem::size_of::<Gdi::BITMAPINFOHEADER>() as u32,
+                biSize: size_of::<Gdi::BITMAPINFOHEADER>() as u32,
                 biWidth: width.get(),
                 biHeight: -height.get(),
                 biPlanes: 1,
@@ -85,13 +86,13 @@ impl Buffer {
         // XXX alignment?
         // XXX better to use CreateFileMapping, and pass hSection?
         // XXX test return value?
-        let mut pixels: *mut u32 = ptr::null_mut();
+        let mut pixels: *mut Pixel = ptr::null_mut();
         let bitmap = unsafe {
             Gdi::CreateDIBSection(
                 dc,
                 &bitmap_info as *const BitmapInfo as *const _,
                 Gdi::DIB_RGB_COLORS,
-                &mut pixels as *mut *mut u32 as _,
+                &mut pixels as *mut *mut Pixel as _,
                 ptr::null_mut(),
                 0,
             )
@@ -114,27 +115,15 @@ impl Buffer {
     }
 
     #[inline]
-    fn pixels(&self) -> &[u32] {
-        unsafe {
-            slice::from_raw_parts(
-                self.pixels.as_ptr(),
-                i32::from(self.width) as usize * i32::from(self.height) as usize,
-            )
-        }
-    }
-
-    #[inline]
-    fn pixels_mut(&mut self) -> &mut [u32] {
-        unsafe {
-            slice::from_raw_parts_mut(
-                self.pixels.as_ptr(),
-                i32::from(self.width) as usize * i32::from(self.height) as usize,
-            )
-        }
+    fn pixels_mut(&mut self) -> &mut [Pixel] {
+        let num_bytes =
+            byte_stride(self.width.get() as u32, 32) as usize * self.height.get() as usize;
+        unsafe { slice::from_raw_parts_mut(self.pixels.as_ptr(), num_bytes / size_of::<Pixel>()) }
     }
 }
 
 /// The handle to a window for software buffering.
+#[derive(Debug)]
 pub struct Win32Impl<D: ?Sized, W> {
     /// The window handle.
     window: OnlyUsedFromOrigin<HWND>,
@@ -170,46 +159,10 @@ struct BitmapInfo {
     bmi_colors: [Gdi::RGBQUAD; 3],
 }
 
-impl<D: HasDisplayHandle, W: HasWindowHandle> Win32Impl<D, W> {
-    fn present_with_damage(&mut self, damage: &[Rect]) -> Result<(), SoftBufferError> {
-        let buffer = self.buffer.as_mut().unwrap();
-        unsafe {
-            for rect in damage.iter().copied() {
-                let (x, y, width, height) = (|| {
-                    Some((
-                        i32::try_from(rect.x).ok()?,
-                        i32::try_from(rect.y).ok()?,
-                        i32::try_from(rect.width.get()).ok()?,
-                        i32::try_from(rect.height.get()).ok()?,
-                    ))
-                })()
-                .ok_or(SoftBufferError::DamageOutOfRange { rect })?;
-                Gdi::BitBlt(
-                    self.dc.0,
-                    x,
-                    y,
-                    width,
-                    height,
-                    buffer.dc,
-                    x,
-                    y,
-                    Gdi::SRCCOPY,
-                );
-            }
-
-            // Validate the window.
-            Gdi::ValidateRect(self.window.0, ptr::null_mut());
-        }
-        buffer.presented = true;
-
-        Ok(())
-    }
-}
-
 impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for Win32Impl<D, W> {
     type Context = D;
     type Buffer<'a>
-        = BufferImpl<'a, D, W>
+        = BufferImpl<'a>
     where
         Self: 'a;
 
@@ -267,55 +220,91 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for Win32Im
         Ok(())
     }
 
-    fn buffer_mut(&mut self) -> Result<BufferImpl<'_, D, W>, SoftBufferError> {
-        if self.buffer.is_none() {
-            panic!("Must set size of surface before calling `buffer_mut()`");
-        }
+    fn buffer_mut(&mut self) -> Result<BufferImpl<'_>, SoftBufferError> {
+        let buffer = self
+            .buffer
+            .as_mut()
+            .expect("Must set size of surface before calling `buffer_mut()`");
 
-        Ok(BufferImpl(self))
+        Ok(BufferImpl {
+            window: &self.window,
+            dc: &self.dc,
+            buffer,
+        })
     }
 
     /// Fetch the buffer from the window.
-    fn fetch(&mut self) -> Result<Vec<u32>, SoftBufferError> {
+    fn fetch(&mut self) -> Result<Vec<Pixel>, SoftBufferError> {
         Err(SoftBufferError::Unimplemented)
     }
 }
 
-pub struct BufferImpl<'a, D, W>(&'a mut Win32Impl<D, W>);
+#[derive(Debug)]
+pub struct BufferImpl<'a> {
+    window: &'a OnlyUsedFromOrigin<HWND>,
+    dc: &'a OnlyUsedFromOrigin<Gdi::HDC>,
+    buffer: &'a mut Buffer,
+}
 
-impl<D: HasDisplayHandle, W: HasWindowHandle> BufferInterface for BufferImpl<'_, D, W> {
-    #[inline]
-    fn pixels(&self) -> &[u32] {
-        self.0.buffer.as_ref().unwrap().pixels()
+impl BufferInterface for BufferImpl<'_> {
+    fn byte_stride(&self) -> NonZeroU32 {
+        let width = self.buffer.width.get() as u32;
+        NonZeroU32::new(byte_stride(width, 32)).unwrap()
+    }
+
+    fn width(&self) -> NonZeroU32 {
+        self.buffer.width.try_into().unwrap()
+    }
+
+    fn height(&self) -> NonZeroU32 {
+        self.buffer.height.try_into().unwrap()
     }
 
     #[inline]
-    fn pixels_mut(&mut self) -> &mut [u32] {
-        self.0.buffer.as_mut().unwrap().pixels_mut()
+    fn pixels_mut(&mut self) -> &mut [Pixel] {
+        self.buffer.pixels_mut()
     }
 
     fn age(&self) -> u8 {
-        match self.0.buffer.as_ref() {
-            Some(buffer) if buffer.presented => 1,
-            _ => 0,
+        if self.buffer.presented {
+            1
+        } else {
+            0
         }
     }
 
-    fn present(self) -> Result<(), SoftBufferError> {
-        let imp = self.0;
-        let buffer = imp.buffer.as_ref().unwrap();
-        imp.present_with_damage(&[Rect {
-            x: 0,
-            y: 0,
-            // We know width/height will be non-negative
-            width: buffer.width.try_into().unwrap(),
-            height: buffer.height.try_into().unwrap(),
-        }])
-    }
-
     fn present_with_damage(self, damage: &[Rect]) -> Result<(), SoftBufferError> {
-        let imp = self.0;
-        imp.present_with_damage(damage)
+        unsafe {
+            for rect in damage {
+                let rect = util::clamp_rect(
+                    *rect,
+                    self.buffer.width.try_into().unwrap(),
+                    self.buffer.height.try_into().unwrap(),
+                );
+                let x = util::to_i32_saturating(rect.x);
+                let y = util::to_i32_saturating(rect.y);
+                let width = util::to_i32_saturating(rect.width.get());
+                let height = util::to_i32_saturating(rect.height.get());
+
+                Gdi::BitBlt(
+                    self.dc.0,
+                    x,
+                    y,
+                    width,
+                    height,
+                    self.buffer.dc,
+                    x,
+                    y,
+                    Gdi::SRCCOPY,
+                );
+            }
+
+            // Validate the window.
+            Gdi::ValidateRect(self.window.0, ptr::null_mut());
+        }
+        self.buffer.presented = true;
+
+        Ok(())
     }
 }
 
@@ -460,11 +449,20 @@ impl Command {
     }
 }
 
+#[derive(Debug)]
 struct OnlyUsedFromOrigin<T>(T);
 unsafe impl<T> Send for OnlyUsedFromOrigin<T> {}
+unsafe impl<T> Sync for OnlyUsedFromOrigin<T> {}
 
 impl<T> From<T> for OnlyUsedFromOrigin<T> {
     fn from(t: T) -> Self {
         Self(t)
     }
+}
+
+#[inline]
+fn byte_stride(width: u32, bit_count: u32) -> u32 {
+    // <https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapinfoheader#calculating-surface-stride>
+    // When `bit_count == 32`, this is always just equal to `width * 4`.
+    ((width * bit_count + 31) & !31) >> 3
 }

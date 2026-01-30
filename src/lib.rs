@@ -2,34 +2,37 @@
 #![allow(clippy::needless_doctest_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 extern crate core;
 
 mod backend_dispatch;
-use backend_dispatch::*;
 mod backend_interface;
-use backend_interface::*;
 mod backends;
 mod error;
+mod format;
+mod pixel;
 mod util;
 
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
-use std::ops;
 use std::sync::Arc;
-
-use error::InitError;
-pub use error::SoftBufferError;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 
-#[cfg(target_arch = "wasm32")]
-pub use backends::web::SurfaceExtWeb;
+use self::backend_dispatch::*;
+use self::backend_interface::*;
+#[cfg(target_family = "wasm")]
+pub use self::backends::web::SurfaceExtWeb;
+use self::error::InitError;
+pub use self::error::SoftBufferError;
+pub use self::format::PixelFormat;
+pub use self::pixel::Pixel;
 
 /// An instance of this struct contains the platform-specific data that must be managed in order to
 /// write to a window on that platform.
+#[derive(Clone, Debug)]
 pub struct Context<D> {
     /// The inner static dispatch object.
     context_impl: ContextDispatch<D>,
@@ -72,6 +75,7 @@ pub struct Rect {
 }
 
 /// A surface for drawing to a window with software buffers.
+#[derive(Debug)]
 pub struct Surface<D, W> {
     /// This is boxed so that `Surface` is the same size on every platform.
     surface_impl: Box<SurfaceDispatch<D, W>>,
@@ -110,7 +114,14 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> Surface<D, W> {
     /// to have the buffer fill the entire window. Use your windowing library to find the size
     /// of the window.
     pub fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) -> Result<(), SoftBufferError> {
-        self.surface_impl.resize(width, height)
+        if u32::MAX / 4 < width.get() {
+            // Stride would be too large.
+            return Err(SoftBufferError::SizeOutOfRange { width, height });
+        }
+
+        self.surface_impl.resize(width, height)?;
+
+        Ok(())
     }
 
     /// Copies the window contents into a buffer.
@@ -121,7 +132,7 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> Surface<D, W> {
     /// - On AppKit, UIKit, Redox and Wayland, this function is unimplemented.
     /// - On Web, this will fail if the content was supplied by
     ///   a different origin depending on the sites CORS rules.
-    pub fn fetch(&mut self) -> Result<Vec<u32>, SoftBufferError> {
+    pub fn fetch(&mut self) -> Result<Vec<Pixel>, SoftBufferError> {
         self.surface_impl.fetch()
     }
 
@@ -134,9 +145,26 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> Surface<D, W> {
     /// - On DRM/KMS, there is no reliable and sound way to wait for the page flip to happen from within
     ///   `softbuffer`. Therefore it is the responsibility of the user to wait for the page flip before
     ///   sending another frame.
-    pub fn buffer_mut(&mut self) -> Result<Buffer<'_, D, W>, SoftBufferError> {
+    pub fn buffer_mut(&mut self) -> Result<Buffer<'_>, SoftBufferError> {
+        let mut buffer_impl = self.surface_impl.buffer_mut()?;
+
+        debug_assert_eq!(
+            buffer_impl.byte_stride().get() % 4,
+            0,
+            "stride must be a multiple of 4"
+        );
+        debug_assert_eq!(
+            buffer_impl.height().get() as usize * buffer_impl.byte_stride().get() as usize,
+            buffer_impl.pixels_mut().len() * 4,
+            "buffer must be sized correctly"
+        );
+        debug_assert!(
+            buffer_impl.width().get() * 4 <= buffer_impl.byte_stride().get(),
+            "width * 4 must be less than or equal to stride"
+        );
+
         Ok(Buffer {
-            buffer_impl: self.surface_impl.buffer_mut()?,
+            buffer_impl,
             _marker: PhantomData,
         })
     }
@@ -160,32 +188,50 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> HasWindowHandle for Surface<D, W> 
 
 /// A buffer that can be written to by the CPU and presented to the window.
 ///
-/// This derefs to a `[u32]`, which depending on the backend may be a mapping into shared memory
-/// accessible to the display server, so presentation doesn't require any (client-side) copying.
+/// The buffer's contents is a [slice] of [`Pixel`]s, which depending on the backend may be a
+/// mapping into shared memory accessible to the display server, so presentation doesn't require any
+/// (client-side) copying.
 ///
 /// This trusts the display server not to mutate the buffer, which could otherwise be unsound.
 ///
 /// # Data representation
 ///
-/// The format of the buffer is as follows. There is one `u32` in the buffer for each pixel in
-/// the area to draw. The first entry is the upper-left most pixel. The second is one to the right
-/// etc. (Row-major top to bottom left to right one `u32` per pixel). Within each `u32` the highest
-/// order 8 bits are to be set to 0. The next highest order 8 bits are the red channel, then the
-/// green channel, and then the blue channel in the lowest-order 8 bits. See the examples for
-/// one way to build this format using bitwise operations.
+/// The buffer data is laid out in row-major order (split into horizontal lines), with origin in the
+/// top-left corner. There is one [`Pixel`] (4 bytes) in the buffer for each pixel in the area to
+/// draw.
 ///
-/// --------
+/// # Reading buffer data
 ///
-/// Pixel format (`u32`):
+/// Reading from buffer data may perform very poorly, as the underlying storage of zero-copy
+/// buffers, where implemented, may set options optimized for CPU writes, that allows them to bypass
+/// certain caches and avoid cache pollution.
 ///
-/// 00000000RRRRRRRRGGGGGGGGBBBBBBBB
+/// As such, when rendering, you should always set the pixel in its entirety:
 ///
-/// 0: Bit is 0
-/// R: Red channel
-/// G: Green channel
-/// B: Blue channel
+/// ```
+/// # use softbuffer::Pixel;
+/// # let pixel = &mut Pixel::default();
+/// # let (red, green, blue) = (0x11, 0x22, 0x33);
+/// *pixel = Pixel::new_rgb(red, green, blue);
+/// ```
+///
+/// Instead of e.g. something like:
+///
+/// ```
+/// # use softbuffer::Pixel;
+/// # let pixel = &mut Pixel::default();
+/// # let (red, green, blue) = (0x11, 0x22, 0x33);
+/// // DISCOURAGED!
+/// *pixel = Pixel::default(); // Clear
+/// pixel.r |= red;
+/// pixel.g |= green;
+/// pixel.b |= blue;
+/// ```
+///
+/// To discourage reading from the buffer, `&self -> &[u8]` methods are intentionally not provided.
 ///
 /// # Platform dependent behavior
+///
 /// No-copy presentation is currently supported on:
 /// - Wayland
 /// - X, when XShm is available
@@ -199,12 +245,40 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> HasWindowHandle for Surface<D, W> 
 ///
 /// Buffer copies an channel swizzling happen on:
 /// - Android
-pub struct Buffer<'a, D, W> {
-    buffer_impl: BufferDispatch<'a, D, W>,
-    _marker: PhantomData<(Arc<D>, Cell<()>)>,
+#[derive(Debug)]
+pub struct Buffer<'a> {
+    buffer_impl: BufferDispatch<'a>,
+    _marker: PhantomData<Cell<()>>,
 }
 
-impl<D: HasDisplayHandle, W: HasWindowHandle> Buffer<'_, D, W> {
+impl Buffer<'_> {
+    /// The number of bytes wide each row in the buffer is.
+    ///
+    /// On some platforms, the buffer is slightly larger than `width * height * 4`, usually for
+    /// performance reasons to align each row such that they are never split across cache lines.
+    ///
+    /// In your code, prefer to use [`Buffer::pixel_rows`] (which handles this correctly), or
+    /// failing that, make sure to chunk rows by the stride instead of the width.
+    ///
+    /// This is guaranteed to be `>= width * 4`, and is guaranteed to be a multiple of 4.
+    #[doc(alias = "pitch")] // SDL and Direct3D
+    #[doc(alias = "bytes_per_row")] // WebGPU
+    #[doc(alias = "row_stride")]
+    #[doc(alias = "stride")]
+    pub fn byte_stride(&self) -> NonZeroU32 {
+        self.buffer_impl.byte_stride()
+    }
+
+    /// The amount of pixels wide the buffer is.
+    pub fn width(&self) -> NonZeroU32 {
+        self.buffer_impl.width()
+    }
+
+    /// The amount of pixels tall the buffer is.
+    pub fn height(&self) -> NonZeroU32 {
+        self.buffer_impl.height()
+    }
+
     /// `age` is the number of frames ago this buffer was last presented. So if the value is
     /// `1`, it is the same as the last frame, and if it is `2`, it is the same as the frame
     /// before that (for backends using double buffering). If the value is `0`, it is a new
@@ -227,11 +301,20 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> Buffer<'_, D, W> {
     ///
     /// If the caller wishes to synchronize other surface/window changes, such requests must be sent to the
     /// Wayland compositor before calling this function.
+    #[inline]
     pub fn present(self) -> Result<(), SoftBufferError> {
-        self.buffer_impl.present()
+        // Damage the entire buffer.
+        self.present_with_damage(&[Rect {
+            x: 0,
+            y: 0,
+            width: NonZeroU32::MAX,
+            height: NonZeroU32::MAX,
+        }])
     }
 
     /// Presents buffer to the window, with damage regions.
+    ///
+    /// Damage regions that fall outside the surface are ignored.
     ///
     /// # Platform dependent behavior
     ///
@@ -247,19 +330,178 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> Buffer<'_, D, W> {
     }
 }
 
-impl<D: HasDisplayHandle, W: HasWindowHandle> ops::Deref for Buffer<'_, D, W> {
-    type Target = [u32];
-
-    #[inline]
-    fn deref(&self) -> &[u32] {
-        self.buffer_impl.pixels()
-    }
-}
-
-impl<D: HasDisplayHandle, W: HasWindowHandle> ops::DerefMut for Buffer<'_, D, W> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut [u32] {
+/// Helper methods for writing to the buffer as RGBA pixel data.
+impl Buffer<'_> {
+    /// Get a mutable reference to the buffer's pixels.
+    ///
+    /// The size of the returned slice is `buffer.byte_stride() * buffer.height() / 4`.
+    ///
+    /// # Examples
+    ///
+    /// Clear the buffer with red.
+    ///
+    /// ```no_run
+    /// # use softbuffer::{Buffer, Pixel};
+    /// # let buffer: Buffer<'_> = unimplemented!();
+    /// buffer.pixels().fill(Pixel::new_rgb(0xff, 0x00, 0x00));
+    /// ```
+    ///
+    /// Render to a slice of `[u8; 4]`s. This might be useful for library authors that want to
+    /// provide a simple API that provides RGBX rendering.
+    ///
+    /// ```no_run
+    /// use softbuffer::{Pixel, PixelFormat};
+    ///
+    /// // Assume the user controls the following rendering function:
+    /// fn render(pixels: &mut [[u8; 4]], width: u32, height: u32) {
+    ///     pixels.fill([0xff, 0xff, 0x00, 0x00]); // Yellow in RGBX
+    /// }
+    ///
+    /// // Then we'd convert pixel data as follows:
+    ///
+    /// # let buffer: softbuffer::Buffer<'_> = todo!();
+    /// # #[cfg(false)]
+    /// let buffer = surface.buffer_mut();
+    ///
+    /// let width = buffer.width().get();
+    /// let height = buffer.height().get();
+    ///
+    /// // Use fast, zero-copy implementation when possible, and fall back to slower version when not.
+    /// if PixelFormat::Rgbx.is_default() && buffer.byte_stride().get() == width * 4 {
+    ///     // SAFETY: `Pixel` can be reinterpreted as `[u8; 4]`.
+    ///     let pixels = unsafe { std::mem::transmute::<&mut [Pixel], &mut [[u8; 4]]>(buffer.pixels()) };
+    ///     // CORRECTNESS: We just checked that the format is RGBX, and that `stride == width * 4`.
+    ///     render(pixels, width, height);
+    /// } else {
+    ///     // Render into temporary buffer.
+    ///     let mut temporary = vec![[0; 4]; width as usize * height as usize];
+    ///     render(&mut temporary, width, height);
+    ///
+    ///     // And copy from temporary buffer to actual pixel data.
+    ///     for (tmp_row, actual_row) in temporary.chunks(width as usize).zip(buffer.pixel_rows()) {
+    ///         for (tmp, actual) in tmp_row.iter().zip(actual_row) {
+    ///             *actual = Pixel::new_rgb(tmp[0], tmp[1], tmp[2]);
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// buffer.present();
+    /// ```
+    pub fn pixels(&mut self) -> &mut [Pixel] {
         self.buffer_impl.pixels_mut()
+    }
+
+    /// Iterate over each row of pixels.
+    ///
+    /// Each slice returned from the iterator has a length of `buffer.byte_stride() / 4`.
+    ///
+    /// # Examples
+    ///
+    /// Fill each row with alternating black and white.
+    ///
+    /// ```no_run
+    /// # use softbuffer::{Buffer, Pixel};
+    /// # let buffer: Buffer<'_> = unimplemented!();
+    /// for (y, row) in buffer.pixel_rows().enumerate() {
+    ///     if y % 2 == 0 {
+    ///         row.fill(Pixel::new_rgb(0xff, 0xff, 0xff));
+    ///     } else {
+    ///         row.fill(Pixel::new_rgb(0x00, 0x00, 0x00));
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Fill a red rectangle while skipping over regions that don't need to be modified.
+    ///
+    /// ```no_run
+    /// # use softbuffer::{Buffer, Pixel};
+    /// # let buffer: Buffer<'_> = unimplemented!();
+    /// let x = 100;
+    /// let y = 200;
+    /// let width = 10;
+    /// let height = 20;
+    ///
+    /// for row in buffer.pixel_rows().skip(y).take(height) {
+    ///     for pixel in row.iter_mut().skip(x).take(width) {
+    ///         *pixel = Pixel::new_rgb(0xff, 0x00, 0x00);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Iterate over each pixel (similar to what the [`pixels_iter`] method does).
+    ///
+    /// [`pixels_iter`]: Self::pixels_iter
+    ///
+    /// ```no_run
+    /// # use softbuffer::{Buffer, Pixel};
+    /// # let buffer: Buffer<'_> = unimplemented!();
+    /// for (y, row) in buffer.pixel_rows().enumerate() {
+    ///     for (x, pixel) in row.iter_mut().enumerate() {
+    ///         *pixel = Pixel::new_rgb((x % 0xff) as u8, (y % 0xff) as u8, 0x00);
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    pub fn pixel_rows(
+        &mut self,
+    ) -> impl DoubleEndedIterator<Item = &mut [Pixel]> + ExactSizeIterator {
+        let pixel_stride = self.byte_stride().get() as usize / 4;
+        let pixels = self.pixels();
+        assert_eq!(pixels.len() % pixel_stride, 0, "must be multiple of stride");
+        // NOTE: This won't panic because `pixel_stride` came from `NonZeroU32`
+        pixels.chunks_mut(pixel_stride)
+    }
+
+    /// Iterate over each pixel in the data.
+    ///
+    /// The returned iterator contains the `x` and `y` coordinates and a mutable reference to the
+    /// pixel at that position.
+    ///
+    /// # Examples
+    ///
+    /// Draw a red rectangle with a margin of 10 pixels, and fill the background with blue.
+    ///
+    /// ```no_run
+    /// # use softbuffer::{Buffer, Pixel};
+    /// # let buffer: Buffer<'_> = unimplemented!();
+    /// let width = buffer.width().get();
+    /// let height = buffer.height().get();
+    /// let left = 10;
+    /// let top = 10;
+    /// let right = width.saturating_sub(10);
+    /// let bottom = height.saturating_sub(10);
+    ///
+    /// for (x, y, pixel) in buffer.pixels_iter() {
+    ///     if (left..=right).contains(&x) && (top..=bottom).contains(&y) {
+    ///         // Inside rectangle.
+    ///         *pixel = Pixel::new_rgb(0xff, 0x00, 0x00);
+    ///     } else {
+    ///         // Outside rectangle.
+    ///         *pixel = Pixel::new_rgb(0x00, 0x00, 0xff);
+    ///     };
+    /// }
+    /// ```
+    ///
+    /// Iterate over the pixel data in reverse, and draw a red rectangle in the top-left corner.
+    ///
+    /// ```no_run
+    /// # use softbuffer::{Buffer, Pixel};
+    /// # let buffer: Buffer<'_> = unimplemented!();
+    /// // Only reverses iteration order, x and y are still relative to the top-left corner.
+    /// for (x, y, pixel) in buffer.pixels_iter().rev() {
+    ///     if x <= 100 && y <= 100 {
+    ///         *pixel = Pixel::new_rgb(0xff, 0x00, 0x00);
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    pub fn pixels_iter(&mut self) -> impl DoubleEndedIterator<Item = (u32, u32, &mut Pixel)> {
+        self.pixel_rows().enumerate().flat_map(|(y, pixels)| {
+            pixels
+                .iter_mut()
+                .enumerate()
+                .map(move |(x, pixel)| (x as u32, y as u32, pixel))
+        })
     }
 }
 
@@ -333,7 +575,7 @@ fn __assert_send() {
     is_send::<Context<()>>();
     is_sync::<Context<()>>();
     is_send::<Surface<(), ()>>();
-    is_send::<Buffer<'static, (), ()>>();
+    is_send::<Buffer<'static>>();
 
     /// ```compile_fail
     /// use softbuffer::Surface;
@@ -346,7 +588,7 @@ fn __assert_send() {
     /// use softbuffer::Buffer;
     ///
     /// fn __is_sync<T: Sync>() {}
-    /// __is_sync::<Buffer<'static, (), ()>>();
+    /// __is_sync::<Buffer<'static>>();
     /// ```
     fn __buffer_not_sync() {}
 }

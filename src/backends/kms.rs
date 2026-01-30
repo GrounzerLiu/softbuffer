@@ -12,31 +12,39 @@ use drm::Device;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 
 use std::collections::HashSet;
-use std::marker::PhantomData;
+use std::fmt;
+use std::mem::size_of;
 use std::num::NonZeroU32;
 use std::os::unix::io::{AsFd, BorrowedFd};
+use std::slice;
 use std::sync::Arc;
 
 use crate::backend_interface::*;
 use crate::error::{InitError, SoftBufferError, SwResultExt};
+use crate::{util, Pixel};
 
-#[derive(Debug)]
-pub(crate) struct KmsDisplayImpl<D: ?Sized> {
-    /// The underlying raw device file descriptor.
-    fd: BorrowedFd<'static>,
-
-    /// Holds a reference to the display.
-    _display: D,
+#[derive(Debug, Clone)]
+struct DrmDevice<'a> {
+    /// The underlying raw display file descriptor.
+    fd: BorrowedFd<'a>,
 }
 
-impl<D: ?Sized> AsFd for KmsDisplayImpl<D> {
+impl AsFd for DrmDevice<'_> {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd
     }
 }
 
-impl<D: ?Sized> Device for KmsDisplayImpl<D> {}
-impl<D: ?Sized> CtrlDevice for KmsDisplayImpl<D> {}
+impl Device for DrmDevice<'_> {}
+impl CtrlDevice for DrmDevice<'_> {}
+
+#[derive(Debug)]
+pub(crate) struct KmsDisplayImpl<D: ?Sized> {
+    device: DrmDevice<'static>,
+
+    /// Holds a reference to the display.
+    _display: D,
+}
 
 impl<D: HasDisplayHandle + ?Sized> ContextInterface<D> for Arc<KmsDisplayImpl<D>> {
     fn new(display: D) -> Result<Self, InitError<D>>
@@ -54,7 +62,7 @@ impl<D: HasDisplayHandle + ?Sized> ContextInterface<D> for Arc<KmsDisplayImpl<D>
         let fd = unsafe { BorrowedFd::borrow_raw(drm.fd) };
 
         Ok(Arc::new(KmsDisplayImpl {
-            fd,
+            device: DrmDevice { fd },
             _display: display,
         }))
     }
@@ -89,7 +97,7 @@ struct Buffers {
 }
 
 /// The buffer implementation.
-pub(crate) struct BufferImpl<'a, D: ?Sized, W: ?Sized> {
+pub(crate) struct BufferImpl<'a> {
     /// The mapping of the dump buffer.
     mapping: DumbMapping<'a>,
 
@@ -105,17 +113,21 @@ pub(crate) struct BufferImpl<'a, D: ?Sized, W: ?Sized> {
     /// The current size.
     size: (NonZeroU32, NonZeroU32),
 
-    /// The display implementation.
-    display: &'a KmsDisplayImpl<D>,
+    /// The device file descriptor.
+    device: DrmDevice<'a>,
 
     /// Age of the front buffer.
     front_age: &'a mut u8,
 
     /// Age of the back buffer.
     back_age: &'a mut u8,
+}
 
-    /// Window reference.
-    _window: PhantomData<&'a mut W>,
+impl fmt::Debug for BufferImpl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // FIXME: Derive instead once `DumbMapping` impls `Debug`.
+        f.debug_struct("BufferImpl").finish_non_exhaustive()
+    }
 }
 
 /// The combined frame buffer and dumb buffer.
@@ -134,12 +146,14 @@ struct SharedBuffer {
 impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> for KmsImpl<D, W> {
     type Context = Arc<KmsDisplayImpl<D>>;
     type Buffer<'a>
-        = BufferImpl<'a, D, W>
+        = BufferImpl<'a>
     where
         Self: 'a;
 
     /// Create a new KMS backend.
     fn new(window: W, display: &Arc<KmsDisplayImpl<D>>) -> Result<Self, InitError<W>> {
+        let device = &display.device;
+
         // Make sure that the window handle is valid.
         let RawWindowHandle::Drm(drm) = window.window_handle()?.as_raw() else {
             return Err(InitError::Unsupported(window));
@@ -148,10 +162,10 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
             NonZeroU32::new(drm.plane).ok_or(SoftBufferError::IncompleteWindowHandle)?;
         let plane_handle = plane::Handle::from(plane_handle);
 
-        let plane_info = display
+        let plane_info = device
             .get_plane(plane_handle)
             .swbuf_err("failed to get plane info")?;
-        let handles = display
+        let handles = device
             .resource_handles()
             .swbuf_err("failed to get resource handles")?;
 
@@ -170,7 +184,7 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
             };
 
             // Get info about the CRTC.
-            display
+            device
                 .get_crtc(handle)
                 .swbuf_err("failed to get CRTC info")?
         };
@@ -179,7 +193,7 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
         let encoders = handles
             .encoders
             .iter()
-            .flat_map(|handle| display.get_encoder(*handle))
+            .flat_map(|handle| device.get_encoder(*handle))
             .filter(|encoder| encoder.crtc() == Some(crtc.handle()))
             .map(|encoder| encoder.handle())
             .collect::<HashSet<_>>();
@@ -188,7 +202,7 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
         let connectors = handles
             .connectors
             .iter()
-            .flat_map(|handle| display.get_connector(*handle, false))
+            .flat_map(|handle| device.get_connector(*handle, false))
             .filter(|connector| {
                 connector
                     .current_encoder()
@@ -238,7 +252,7 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
     }
     */
 
-    fn buffer_mut(&mut self) -> Result<BufferImpl<'_, D, W>, SoftBufferError> {
+    fn buffer_mut(&mut self) -> Result<BufferImpl<'_>, SoftBufferError> {
         // Map the dumb buffer.
         let set = self
             .buffer
@@ -260,6 +274,7 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
 
         let mapping = self
             .display
+            .device
             .map_dumb_buffer(&mut front_buffer.db)
             .swbuf_err("failed to map dumb buffer")?;
 
@@ -269,10 +284,9 @@ impl<D: HasDisplayHandle + ?Sized, W: HasWindowHandle> SurfaceInterface<D, W> fo
             first_is_front: &mut set.first_is_front,
             front_fb,
             crtc_handle: self.crtc.handle(),
-            display: &self.display,
+            device: self.display.device.clone(),
             front_age,
             back_age,
-            _window: PhantomData,
         })
     }
 }
@@ -281,6 +295,7 @@ impl<D: ?Sized, W: ?Sized> Drop for KmsImpl<D, W> {
     fn drop(&mut self) {
         // Map the CRTC to the information that was there before.
         self.display
+            .device
             .set_crtc(
                 self.crtc.handle(),
                 self.crtc.framebuffer(),
@@ -292,15 +307,27 @@ impl<D: ?Sized, W: ?Sized> Drop for KmsImpl<D, W> {
     }
 }
 
-impl<D: ?Sized, W: ?Sized> BufferInterface for BufferImpl<'_, D, W> {
-    #[inline]
-    fn pixels(&self) -> &[u32] {
-        bytemuck::cast_slice(self.mapping.as_ref())
+impl BufferInterface for BufferImpl<'_> {
+    fn byte_stride(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.width().get() * 4).unwrap()
+    }
+
+    fn width(&self) -> NonZeroU32 {
+        self.size.0
+    }
+
+    fn height(&self) -> NonZeroU32 {
+        self.size.1
     }
 
     #[inline]
-    fn pixels_mut(&mut self) -> &mut [u32] {
-        bytemuck::cast_slice_mut(self.mapping.as_mut())
+    fn pixels_mut(&mut self) -> &mut [Pixel] {
+        let ptr = self.mapping.as_mut_ptr().cast::<Pixel>();
+        let len = self.mapping.len() / size_of::<Pixel>();
+        debug_assert_eq!(self.mapping.len() % size_of::<Pixel>(), 0);
+        // SAFETY: `&mut [u8]` can be reinterpreted as `&mut [Pixel]`, assuming that the allocation
+        // is aligned to at least a multiple of 4 bytes.
+        unsafe { slice::from_raw_parts_mut(ptr, len) }
     }
 
     #[inline]
@@ -310,24 +337,17 @@ impl<D: ?Sized, W: ?Sized> BufferInterface for BufferImpl<'_, D, W> {
 
     #[inline]
     fn present_with_damage(self, damage: &[crate::Rect]) -> Result<(), SoftBufferError> {
-        let rectangles = damage
+        let rectangles: Vec<_> = damage
             .iter()
-            .map(|&rect| {
-                let err = || SoftBufferError::DamageOutOfRange { rect };
-                Ok::<_, SoftBufferError>(ClipRect::new(
-                    rect.x.try_into().map_err(|_| err())?,
-                    rect.y.try_into().map_err(|_| err())?,
-                    rect.x
-                        .checked_add(rect.width.get())
-                        .and_then(|x| x.try_into().ok())
-                        .ok_or_else(err)?,
-                    rect.y
-                        .checked_add(rect.height.get())
-                        .and_then(|y| y.try_into().ok())
-                        .ok_or_else(err)?,
-                ))
+            .map(|rect| {
+                ClipRect::new(
+                    util::to_u16_saturating(rect.x),
+                    util::to_u16_saturating(rect.y),
+                    util::to_u16_saturating(rect.x.saturating_add(rect.width.get())),
+                    util::to_u16_saturating(rect.y.saturating_add(rect.height.get())),
+                )
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
 
         // Dirty the framebuffer with out damage rectangles.
         //
@@ -335,7 +355,7 @@ impl<D: ?Sized, W: ?Sized> BufferInterface for BufferImpl<'_, D, W> {
         // TODO: It would be nice to not have to heap-allocate the above rectangles if we know that
         // this is going to fail. Low hanging fruit PR: add a flag that's set to false if this
         // returns `ENOSYS` and check that before allocating the above and running this.
-        match self.display.dirty_framebuffer(self.front_fb, &rectangles) {
+        match self.device.dirty_framebuffer(self.front_fb, &rectangles) {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(rustix::io::Errno::NOSYS.raw_os_error()) => {}
             Err(e) => {
@@ -348,7 +368,7 @@ impl<D: ?Sized, W: ?Sized> BufferInterface for BufferImpl<'_, D, W> {
 
         // Swap the buffers.
         // TODO: Use atomic commits here!
-        self.display
+        self.device
             .page_flip(self.crtc_handle, self.front_fb, PageFlipFlags::EVENT, None)
             .swbuf_err("failed to page flip")?;
 
@@ -363,17 +383,6 @@ impl<D: ?Sized, W: ?Sized> BufferInterface for BufferImpl<'_, D, W> {
 
         Ok(())
     }
-
-    #[inline]
-    fn present(self) -> Result<(), SoftBufferError> {
-        let (width, height) = self.size;
-        self.present_with_damage(&[crate::Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        }])
-    }
 }
 
 impl SharedBuffer {
@@ -384,9 +393,11 @@ impl SharedBuffer {
         height: NonZeroU32,
     ) -> Result<Self, SoftBufferError> {
         let db = display
+            .device
             .create_dumb_buffer((width.get(), height.get()), DrmFourcc::Xrgb8888, 32)
             .swbuf_err("failed to create dumb buffer")?;
         let fb = display
+            .device
             .add_framebuffer(&db, 24, 32)
             .swbuf_err("failed to add framebuffer")?;
 

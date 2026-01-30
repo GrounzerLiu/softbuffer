@@ -1,11 +1,23 @@
 //! Example of using `softbuffer` with `libxcb`.
 
-#[cfg(all(feature = "x11", any(target_os = "linux", target_os = "freebsd")))]
+mod util;
+
+#[cfg(all(
+    feature = "x11",
+    not(any(
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox",
+        target_family = "wasm",
+        target_os = "windows"
+    ))
+))]
 mod example {
     use raw_window_handle::{
         DisplayHandle, RawDisplayHandle, RawWindowHandle, WindowHandle, XcbDisplayHandle,
         XcbWindowHandle,
     };
+    use softbuffer::{Context, Pixel, Surface};
     use std::{env, num::NonZeroU32, ptr::NonNull};
     use x11rb::{
         connection::Connection,
@@ -15,8 +27,6 @@ mod example {
         },
         xcb_ffi::XCBConnection,
     };
-
-    const RED: u32 = 255 << 16;
 
     pub(crate) fn run() {
         // Create a new XCB connection
@@ -67,8 +77,8 @@ mod example {
             unsafe { DisplayHandle::borrow_raw(RawDisplayHandle::Xcb(display_handle)) };
         let window_handle =
             unsafe { WindowHandle::borrow_raw(RawWindowHandle::Xcb(window_handle)) };
-        let context = softbuffer::Context::new(display_handle).unwrap();
-        let mut surface = softbuffer::Surface::new(&context, window_handle).unwrap();
+        let context = Context::new(display_handle).unwrap();
+        let mut surface = Surface::new(&context, window_handle).unwrap();
 
         // Register an atom for closing the window.
         let wm_protocols_atom = conn
@@ -113,7 +123,7 @@ mod example {
                         )
                         .unwrap();
                     let mut buffer = surface.buffer_mut().unwrap();
-                    buffer.fill(RED);
+                    buffer.pixels().fill(Pixel::new_rgb(0xff, 0, 0));
                     buffer.present().unwrap();
                 }
                 Event::ConfigureNotify(configure_notify) => {
@@ -135,12 +145,34 @@ mod example {
     }
 }
 
-#[cfg(all(feature = "x11", any(target_os = "linux", target_os = "freebsd")))]
+#[cfg(all(
+    feature = "x11",
+    not(any(
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox",
+        target_family = "wasm",
+        target_os = "windows"
+    ))
+))]
 fn main() {
+    util::setup();
+
     example::run();
 }
 
-#[cfg(not(all(feature = "x11", any(target_os = "linux", target_os = "freebsd"))))]
+#[cfg(not(all(
+    feature = "x11",
+    not(any(
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox",
+        target_family = "wasm",
+        target_os = "windows"
+    ))
+)))]
 fn main() {
-    eprintln!("This example requires the `x11` feature to be enabled on a supported platform.");
+    util::setup();
+
+    panic!("This example requires the `x11` feature to be enabled on a supported platform.")
 }

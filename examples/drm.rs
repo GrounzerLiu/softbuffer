@@ -1,12 +1,23 @@
 //! Example of using softbuffer with drm-rs.
 
-#[cfg(kms_platform)]
+mod util;
+
+#[cfg(all(
+    feature = "kms",
+    not(any(
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox",
+        target_family = "wasm",
+        target_os = "windows"
+    ))
+))]
 mod imple {
     use drm::control::{connector, Device as CtrlDevice, Event, ModeTypeFlags, PlaneType};
     use drm::Device;
 
     use raw_window_handle::{DisplayHandle, DrmDisplayHandle, DrmWindowHandle, WindowHandle};
-    use softbuffer::{Context, Surface};
+    use softbuffer::{Context, Pixel, Surface};
 
     use std::num::NonZeroU32;
     use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd};
@@ -113,11 +124,11 @@ mod imple {
         let mut tick = 0;
         while Instant::now().duration_since(start) < Duration::from_secs(2) {
             tick += 1;
-            println!("Drawing tick {tick}");
+            tracing::info!("Drawing tick {tick}");
 
             // Start drawing.
             let mut buffer = surface.buffer_mut()?;
-            draw_to_buffer(&mut buffer, tick);
+            draw_to_buffer(buffer.pixels(), tick);
             buffer.present()?;
 
             // Wait for the page flip to happen.
@@ -126,22 +137,22 @@ mod imple {
                     &device,
                     rustix::event::PollFlags::IN,
                 )],
-                -1,
+                None,
             )?;
 
             // Receive the events.
             let events = device.receive_events()?;
-            println!("Got some events...");
+            tracing::info!("Got some events...");
             for event in events {
                 match event {
                     Event::PageFlip(_) => {
-                        println!("Page flip event.");
+                        tracing::info!("Page flip event.");
                     }
                     Event::Vblank(_) => {
-                        println!("Vblank event.");
+                        tracing::info!("Vblank event.");
                     }
                     _ => {
-                        println!("Unknown event.");
+                        tracing::info!("Unknown event.");
                     }
                 }
             }
@@ -150,7 +161,7 @@ mod imple {
         Ok(())
     }
 
-    fn draw_to_buffer(buf: &mut [u32], tick: usize) {
+    fn draw_to_buffer(buf: &mut [Pixel], tick: usize) {
         let scale = colorous::SINEBOW;
         let mut i = (tick as f64) / 20.0;
         while i > 1.0 {
@@ -158,8 +169,7 @@ mod imple {
         }
 
         let color = scale.eval_continuous(i);
-        let pixel = (color.r as u32) << 16 | (color.g as u32) << 8 | (color.b as u32);
-        buf.fill(pixel);
+        buf.fill(Pixel::new_rgb(color.r, color.g, color.b));
     }
 
     struct Card(std::fs::File);
@@ -210,14 +220,24 @@ mod imple {
     impl CtrlDevice for Card {}
 }
 
-#[cfg(not(kms_platform))]
+#[cfg(not(all(
+    feature = "kms",
+    not(any(
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox",
+        target_family = "wasm",
+        target_os = "windows"
+    ))
+)))]
 mod imple {
     pub(super) fn entry() -> Result<(), Box<dyn std::error::Error>> {
-        eprintln!("This example requires the `kms` feature.");
-        Ok(())
+        panic!("This example requires the `kms` feature.")
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    util::setup();
+
     imple::entry()
 }

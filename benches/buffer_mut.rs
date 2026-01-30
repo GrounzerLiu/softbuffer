@@ -1,68 +1,97 @@
 #![allow(deprecated)] // TODO
 
-use criterion::{criterion_group, criterion_main, Criterion};
+#[cfg(not(any(
+    target_family = "wasm",
+    all(target_vendor = "apple", not(target_os = "macos")),
+    target_os = "redox"
+)))]
+fn buffer_mut(c: &mut criterion::Criterion) {
+    use criterion::black_box;
+    use softbuffer::{Context, Pixel, Surface};
+    use std::num::NonZeroU32;
+    use winit::event_loop::ControlFlow;
+    use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 
-fn buffer_mut(c: &mut Criterion) {
-    #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
-    {
-        // Do nothing.
-        let _ = c;
-    }
-
-    #[cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))]
-    {
-        use criterion::black_box;
-        use softbuffer::{Context, Surface};
-        use std::num::NonZeroU32;
-        use winit::event_loop::ControlFlow;
-        use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
-
-        let mut evl = winit::event_loop::EventLoop::new().unwrap();
-        let window = evl
-            .create_window(winit::window::Window::default_attributes().with_visible(false))
-            .unwrap();
-
-        evl.run_on_demand(move |ev, elwt| {
-            elwt.set_control_flow(ControlFlow::Poll);
-
-            if let winit::event::Event::AboutToWait = ev {
-                elwt.exit();
-
-                let mut surface = {
-                    let context = Context::new(elwt).unwrap();
-                    Surface::new(&context, &window).unwrap()
-                };
-
-                let size = window.inner_size();
-                surface
-                    .resize(
-                        NonZeroU32::new(size.width).unwrap(),
-                        NonZeroU32::new(size.height).unwrap(),
-                    )
-                    .unwrap();
-
-                c.bench_function("buffer_mut()", |b| {
-                    b.iter(|| {
-                        for _ in 0..500 {
-                            black_box(surface.buffer_mut().unwrap());
-                        }
-                    });
-                });
-
-                c.bench_function("pixels_mut()", |b| {
-                    let mut buffer = surface.buffer_mut().unwrap();
-                    b.iter(|| {
-                        for _ in 0..500 {
-                            let x: &mut [u32] = &mut buffer;
-                            black_box(x);
-                        }
-                    });
-                });
-            }
-        })
+    let mut evl = winit::event_loop::EventLoop::new().unwrap();
+    let context = Context::new(evl.owned_display_handle()).unwrap();
+    let window = evl
+        .create_window(winit::window::Window::default_attributes().with_visible(false))
         .unwrap();
-    }
+
+    evl.run_on_demand(move |ev, elwt| {
+        elwt.set_control_flow(ControlFlow::Poll);
+
+        if let winit::event::Event::AboutToWait = ev {
+            elwt.exit();
+
+            let mut surface = Surface::new(&context, &window).unwrap();
+
+            let size = window.inner_size();
+            surface
+                .resize(
+                    NonZeroU32::new(size.width).unwrap(),
+                    NonZeroU32::new(size.height).unwrap(),
+                )
+                .unwrap();
+
+            c.bench_function("buffer_mut()", |b| {
+                b.iter(|| {
+                    black_box(surface.buffer_mut().unwrap());
+                });
+            });
+
+            c.bench_function("pixels()", |b| {
+                let mut buffer = surface.buffer_mut().unwrap();
+                b.iter(|| {
+                    let pixels: &mut [Pixel] = buffer.pixels();
+                    black_box(pixels);
+                });
+            });
+
+            c.bench_function("fill pixels", |b| {
+                let mut buffer = surface.buffer_mut().unwrap();
+                b.iter(|| {
+                    let buffer = black_box(&mut buffer);
+                    buffer.pixels().fill(Pixel::default());
+                });
+            });
+
+            c.bench_function("render pixels_iter", |b| {
+                let mut buffer = surface.buffer_mut().unwrap();
+                b.iter(|| {
+                    let buffer = black_box(&mut buffer);
+                    for (x, y, pixel) in buffer.pixels_iter() {
+                        let red = (x & 0xff) ^ (y & 0xff);
+                        let green = (x & 0x7f) ^ (y & 0x7f);
+                        let blue = (x & 0x3f) ^ (y & 0x3f);
+                        *pixel = Pixel::new_rgb(red as u8, green as u8, blue as u8);
+                    }
+                });
+            });
+        }
+    })
+    .unwrap();
 }
 
-criterion_group!(benches, buffer_mut);
-criterion_main!(benches);
+#[cfg(not(any(
+    target_family = "wasm",
+    all(target_vendor = "apple", not(target_os = "macos")),
+    target_os = "redox"
+)))]
+criterion::criterion_group!(benches, buffer_mut);
+
+#[cfg(not(any(
+    target_family = "wasm",
+    all(target_vendor = "apple", not(target_os = "macos")),
+    target_os = "redox"
+)))]
+criterion::criterion_main!(benches);
+
+#[cfg(any(
+    target_family = "wasm",
+    all(target_vendor = "apple", not(target_os = "macos")),
+    target_os = "redox"
+))]
+fn main() {
+    panic!("unsupported on WASM, iOS and Redox");
+}

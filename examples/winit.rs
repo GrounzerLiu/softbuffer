@@ -1,37 +1,36 @@
+use softbuffer::{Context, Pixel, Surface};
 use std::num::NonZeroU32;
-use winit::event::{Event, KeyEvent, WindowEvent};
+use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 
-#[path = "utils/winit_app.rs"]
-mod winit_app;
+mod util;
 
 #[cfg(not(target_os = "android"))]
 fn main() {
+    util::setup();
+
     entry(EventLoop::new().unwrap())
 }
 
 pub(crate) fn entry(event_loop: EventLoop<()>) {
-    let app = winit_app::WinitAppBuilder::with_init(
-        |elwt| {
-            let window = winit_app::make_window(elwt, |w| w);
+    let context = Context::new(event_loop.owned_display_handle()).unwrap();
 
-            let context = softbuffer::Context::new(window.clone()).unwrap();
-
-            (window, context)
-        },
-        |_elwt, (window, context)| softbuffer::Surface::new(context, window.clone()).unwrap(),
+    let app = util::WinitAppBuilder::with_init(
+        |elwt| util::make_window(elwt, |w| w),
+        move |_elwt, window| Surface::new(&context, window.clone()).unwrap(),
     )
-    .with_event_handler(|(window, _context), surface, event, elwt| {
+    .with_event_handler(|window, surface, window_id, event, elwt| {
         elwt.set_control_flow(ControlFlow::Wait);
 
+        if window_id != window.id() {
+            return;
+        }
+
         match event {
-            Event::WindowEvent {
-                window_id,
-                event: WindowEvent::Resized(size),
-            } if window_id == window.id() => {
+            WindowEvent::Resized(size) => {
                 let Some(surface) = surface else {
-                    eprintln!("Resized fired before Resumed or after Suspended");
+                    tracing::error!("Resized fired before Resumed or after Suspended");
                     return;
                 };
 
@@ -41,50 +40,36 @@ pub(crate) fn entry(event_loop: EventLoop<()>) {
                     surface.resize(width, height).unwrap();
                 }
             }
-            Event::WindowEvent {
-                window_id,
-                event: WindowEvent::RedrawRequested,
-            } if window_id == window.id() => {
+            WindowEvent::RedrawRequested => {
                 let Some(surface) = surface else {
-                    eprintln!("RedrawRequested fired before Resumed or after Suspended");
+                    tracing::error!("RedrawRequested fired before Resumed or after Suspended");
                     return;
                 };
-                let size = window.inner_size();
-                if let (Some(width), Some(height)) =
-                    (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-                {
-                    let mut buffer = surface.buffer_mut().unwrap();
-                    for y in 0..height.get() {
-                        for x in 0..width.get() {
-                            let red = x % 255;
-                            let green = y % 255;
-                            let blue = (x * y) % 255;
-                            let index = y as usize * width.get() as usize + x as usize;
-                            buffer[index] = blue | (green << 8) | (red << 16);
-                        }
-                    }
 
-                    buffer.present().unwrap();
+                let mut buffer = surface.buffer_mut().unwrap();
+                for (x, y, pixel) in buffer.pixels_iter() {
+                    let red = x % 255;
+                    let green = y % 255;
+                    let blue = (x * y) % 255;
+                    *pixel = Pixel::new_rgb(red as u8, green as u8, blue as u8);
                 }
+
+                buffer.present().unwrap();
             }
-            Event::WindowEvent {
+            WindowEvent::CloseRequested
+            | WindowEvent::KeyboardInput {
                 event:
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                logical_key: Key::Named(NamedKey::Escape),
-                                ..
-                            },
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::Escape),
                         ..
                     },
-                window_id,
-            } if window_id == window.id() => {
+                ..
+            } => {
                 elwt.exit();
             }
             _ => {}
         }
     });
 
-    winit_app::run_app(event_loop, app);
+    util::run_app(event_loop, app);
 }

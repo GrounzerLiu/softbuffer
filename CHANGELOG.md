@@ -1,7 +1,35 @@
 # Unreleased
 
-- Update to `objc2` 0.6.0.
+- Added `PixelFormat` enum.
+- Added `Buffer::pixels()` for accessing the buffer's pixel data.
+- Added `Buffer::pixel_rows()` for iterating over rows of the buffer data.
+- Added `Buffer::pixels_iter()` for iterating over each pixel with its associated `x`/`y` coordinate.
+- Added `Buffer::byte_stride()` for pixel buffers whose rows are aligned and may contain padding bytes at the end. Prefer to use the above helpers instead of accessing pixel data directly.
+- **Breaking:** Add `Pixel` struct, and use that for pixels instead of `u32`.
+- **Breaking:** The pixel format is now target-dependent. Access `PixelFormat::default()` to see which format is used on the current platform.
+- **Breaking:** Removed generic type parameters `D` and `W` from `Buffer<'_>` struct.
+- **Breaking:** Removed `Deref[Mut]` implementation on `Buffer<'_>`. Use `Buffer::pixels()` instead.
+- **Breaking:** Removed unintentional Cargo features for Softbuffer's optional dependencies.
+- **Breaking:** Disable the DRM/KMS backend by default.
+- **Breaking:** Removed `DamageOutOfRange` error case. If the damage value is greater than the backend supports, it is instead clamped to an appropriate value.
+- Fixed `present_with_damage` with bounds out of range on Windows, Web and X11.
+
+# 0.4.7
+
+- Fix documentation building on `docs.rs`.
+
+# 0.4.7
+
+- Added support for Android using the `ndk` crate.
+- Added support for `wasm64-*` targets.
+- Improved examples.
+- Added `Buffer::width()` and `Buffer::height()` getters.
+- `Context` now implements `Clone`.
+- `Context`, `Surface` and `Buffer` now implement `Debug`.
 - Bump MSRV to Rust 1.71.
+- Replace `log` with `tracing`.
+- Remove `cfg_aliases` dependency.
+- Update to `objc2` 0.6, `objc2-*` 0.3, `drm` 0.14, `rustix` 1.0 and `windows-sys` 0.61.
 
 # 0.4.6
 

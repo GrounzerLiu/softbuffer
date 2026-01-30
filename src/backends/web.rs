@@ -11,13 +11,14 @@ use web_sys::{OffscreenCanvas, OffscreenCanvasRenderingContext2d};
 
 use crate::backend_interface::*;
 use crate::error::{InitError, SwResultExt};
-use crate::{util, NoDisplayHandle, NoWindowHandle, Rect, SoftBufferError};
+use crate::{util, NoDisplayHandle, NoWindowHandle, Pixel, Rect, SoftBufferError};
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
 
 /// Display implementation for the web platform.
 ///
 /// This just caches the document to prevent having to query it every time.
+#[derive(Clone, Debug)]
 pub struct WebDisplayImpl<D> {
     document: web_sys::Document,
     _display: D,
@@ -42,12 +43,13 @@ impl<D: HasDisplayHandle> ContextInterface<D> for WebDisplayImpl<D> {
     }
 }
 
+#[derive(Debug)]
 pub struct WebImpl<D, W> {
     /// The handle and context to the canvas that we're drawing to.
     canvas: Canvas,
 
     /// The buffer that we're drawing to.
-    buffer: Vec<u32>,
+    buffer: util::PixelBuffer,
 
     /// Buffer has been presented.
     buffer_presented: bool,
@@ -64,6 +66,7 @@ pub struct WebImpl<D, W> {
 
 /// Holding canvas and context for [`HtmlCanvasElement`] or [`OffscreenCanvas`],
 /// since they have different types.
+#[derive(Debug)]
 enum Canvas {
     Canvas {
         canvas: HtmlCanvasElement,
@@ -81,7 +84,7 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> WebImpl<D, W> {
 
         Ok(Self {
             canvas: Canvas::Canvas { canvas, ctx },
-            buffer: Vec::new(),
+            buffer: util::PixelBuffer(Vec::new()),
             buffer_presented: false,
             size: None,
             window_handle: window,
@@ -97,7 +100,7 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> WebImpl<D, W> {
 
         Ok(Self {
             canvas: Canvas::OffscreenCanvas { canvas, ctx },
-            buffer: Vec::new(),
+            buffer: util::PixelBuffer(Vec::new()),
             buffer_presented: false,
             size: None,
             window_handle: window,
@@ -119,95 +122,12 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> WebImpl<D, W> {
 
         Ok(ctx)
     }
-
-    fn present_with_damage(&mut self, damage: &[Rect]) -> Result<(), SoftBufferError> {
-        let (buffer_width, _buffer_height) = self
-            .size
-            .expect("Must set size of surface before calling `present_with_damage()`");
-
-        let union_damage = if let Some(rect) = util::union_damage(damage) {
-            rect
-        } else {
-            return Ok(());
-        };
-
-        // Create a bitmap from the buffer.
-        let bitmap: Vec<_> = self
-            .buffer
-            .chunks_exact(buffer_width.get() as usize)
-            .skip(union_damage.y as usize)
-            .take(union_damage.height.get() as usize)
-            .flat_map(|row| {
-                row.iter()
-                    .skip(union_damage.x as usize)
-                    .take(union_damage.width.get() as usize)
-            })
-            .copied()
-            .flat_map(|pixel| [(pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8, 255])
-            .collect();
-
-        debug_assert_eq!(
-            bitmap.len() as u32,
-            union_damage.width.get() * union_damage.height.get() * 4
-        );
-
-        #[cfg(target_feature = "atomics")]
-        #[allow(non_local_definitions)]
-        let result = {
-            // When using atomics, the underlying memory becomes `SharedArrayBuffer`,
-            // which can't be shared with `ImageData`.
-            use js_sys::{Uint8Array, Uint8ClampedArray};
-            use wasm_bindgen::prelude::wasm_bindgen;
-
-            #[wasm_bindgen]
-            extern "C" {
-                #[wasm_bindgen(js_name = ImageData)]
-                type ImageDataExt;
-
-                #[wasm_bindgen(catch, constructor, js_class = ImageData)]
-                fn new(array: Uint8ClampedArray, sw: u32) -> Result<ImageDataExt, JsValue>;
-            }
-
-            let array = Uint8Array::new_with_length(bitmap.len() as u32);
-            array.copy_from(&bitmap);
-            let array = Uint8ClampedArray::new(&array);
-            ImageDataExt::new(array, union_damage.width.get())
-                .map(JsValue::from)
-                .map(ImageData::unchecked_from_js)
-        };
-        #[cfg(not(target_feature = "atomics"))]
-        let result = ImageData::new_with_u8_clamped_array(
-            wasm_bindgen::Clamped(&bitmap),
-            union_damage.width.get(),
-        );
-        // This should only throw an error if the buffer we pass's size is incorrect.
-        let image_data = result.unwrap();
-
-        for rect in damage {
-            // This can only throw an error if `data` is detached, which is impossible.
-            self.canvas
-                .put_image_data(
-                    &image_data,
-                    union_damage.x.into(),
-                    union_damage.y.into(),
-                    (rect.x - union_damage.x).into(),
-                    (rect.y - union_damage.y).into(),
-                    rect.width.get().into(),
-                    rect.height.get().into(),
-                )
-                .unwrap();
-        }
-
-        self.buffer_presented = true;
-
-        Ok(())
-    }
 }
 
 impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for WebImpl<D, W> {
     type Context = WebDisplayImpl<D>;
     type Buffer<'a>
-        = BufferImpl<'a, D, W>
+        = BufferImpl<'a>
     where
         Self: 'a;
 
@@ -251,7 +171,8 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for WebImpl
     fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) -> Result<(), SoftBufferError> {
         if self.size != Some((width, height)) {
             self.buffer_presented = false;
-            self.buffer.resize(total_len(width.get(), height.get()), 0);
+            self.buffer
+                .resize(total_len(width.get(), height.get()), Pixel::default());
             self.canvas.set_width(width.get());
             self.canvas.set_height(height.get());
             self.size = Some((width, height));
@@ -260,11 +181,16 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for WebImpl
         Ok(())
     }
 
-    fn buffer_mut(&mut self) -> Result<BufferImpl<'_, D, W>, SoftBufferError> {
-        Ok(BufferImpl { imp: self })
+    fn buffer_mut(&mut self) -> Result<BufferImpl<'_>, SoftBufferError> {
+        Ok(BufferImpl {
+            canvas: &self.canvas,
+            buffer: &mut self.buffer,
+            buffer_presented: &mut self.buffer_presented,
+            size: self.size,
+        })
     }
 
-    fn fetch(&mut self) -> Result<Vec<u32>, SoftBufferError> {
+    fn fetch(&mut self) -> Result<Vec<Pixel>, SoftBufferError> {
         let (width, height) = self
             .size
             .expect("Must set size of surface before calling `fetch()`");
@@ -280,7 +206,12 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for WebImpl
             .data()
             .0
             .chunks_exact(4)
-            .map(|chunk| u32::from_be_bytes([0, chunk[0], chunk[1], chunk[2]]))
+            .map(|chunk| Pixel {
+                r: chunk[0],
+                g: chunk[1],
+                b: chunk[2],
+                a: 0,
+            })
             .collect())
     }
 }
@@ -372,21 +303,37 @@ impl Canvas {
     }
 }
 
-pub struct BufferImpl<'a, D, W> {
-    imp: &'a mut WebImpl<D, W>,
+#[derive(Debug)]
+pub struct BufferImpl<'a> {
+    canvas: &'a Canvas,
+    buffer: &'a mut util::PixelBuffer,
+    buffer_presented: &'a mut bool,
+    size: Option<(NonZeroU32, NonZeroU32)>,
 }
 
-impl<D: HasDisplayHandle, W: HasWindowHandle> BufferInterface for BufferImpl<'_, D, W> {
-    fn pixels(&self) -> &[u32] {
-        &self.imp.buffer
+impl BufferInterface for BufferImpl<'_> {
+    fn byte_stride(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.width().get() * 4).unwrap()
     }
 
-    fn pixels_mut(&mut self) -> &mut [u32] {
-        &mut self.imp.buffer
+    fn width(&self) -> NonZeroU32 {
+        self.size
+            .expect("must set size of surface before calling `width()` on the buffer")
+            .0
+    }
+
+    fn height(&self) -> NonZeroU32 {
+        self.size
+            .expect("must set size of surface before calling `height()` on the buffer")
+            .1
+    }
+
+    fn pixels_mut(&mut self) -> &mut [Pixel] {
+        self.buffer
     }
 
     fn age(&self) -> u8 {
-        if self.imp.buffer_presented {
+        if *self.buffer_presented {
             1
         } else {
             0
@@ -394,21 +341,89 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> BufferInterface for BufferImpl<'_,
     }
 
     /// Push the buffer to the canvas.
-    fn present(self) -> Result<(), SoftBufferError> {
-        let (width, height) = self
-            .imp
-            .size
-            .expect("Must set size of surface before calling `present()`");
-        self.imp.present_with_damage(&[Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        }])
-    }
-
     fn present_with_damage(self, damage: &[Rect]) -> Result<(), SoftBufferError> {
-        self.imp.present_with_damage(damage)
+        let (buffer_width, buffer_height) = self
+            .size
+            .expect("Must set size of surface before calling `present_with_damage()`");
+
+        let union_damage = if let Some(rect) = util::union_damage(damage) {
+            util::clamp_rect(rect, buffer_width, buffer_height)
+        } else {
+            return Ok(());
+        };
+
+        // Create a bitmap from the buffer.
+        let bitmap: Vec<_> = self
+            .buffer
+            .chunks_exact(buffer_width.get() as usize)
+            .skip(union_damage.y as usize)
+            .take(union_damage.height.get() as usize)
+            .flat_map(|row| {
+                row.iter()
+                    .skip(union_damage.x as usize)
+                    .take(union_damage.width.get() as usize)
+            })
+            .copied()
+            .flat_map(|pixel| [pixel.r, pixel.g, pixel.b, 0xff])
+            .collect();
+
+        debug_assert_eq!(
+            bitmap.len(),
+            union_damage.width.get() as usize * union_damage.height.get() as usize * 4
+        );
+
+        #[cfg(target_feature = "atomics")]
+        #[allow(non_local_definitions)]
+        let result = {
+            // When using atomics, the underlying memory becomes `SharedArrayBuffer`,
+            // which can't be shared with `ImageData`.
+            use js_sys::{Uint8Array, Uint8ClampedArray};
+            use wasm_bindgen::prelude::wasm_bindgen;
+
+            #[wasm_bindgen]
+            extern "C" {
+                #[wasm_bindgen(js_name = ImageData)]
+                type ImageDataExt;
+
+                #[wasm_bindgen(catch, constructor, js_class = ImageData)]
+                fn new(array: Uint8ClampedArray, sw: u32) -> Result<ImageDataExt, JsValue>;
+            }
+
+            let array = Uint8Array::new_with_length(bitmap.len() as u32);
+            array.copy_from(&bitmap);
+            let array = Uint8ClampedArray::new(&array);
+            ImageDataExt::new(array, union_damage.width.get())
+                .map(JsValue::from)
+                .map(ImageData::unchecked_from_js)
+        };
+        #[cfg(not(target_feature = "atomics"))]
+        let result = ImageData::new_with_u8_clamped_array(
+            wasm_bindgen::Clamped(&bitmap),
+            union_damage.width.get(),
+        );
+        // This should only throw an error if the buffer we pass's size is incorrect.
+        let image_data = result.unwrap();
+
+        for rect in damage {
+            let rect = util::clamp_rect(*rect, buffer_width, buffer_height);
+
+            // This can only throw an error if `data` is detached, which is impossible.
+            self.canvas
+                .put_image_data(
+                    &image_data,
+                    union_damage.x.into(),
+                    union_damage.y.into(),
+                    (rect.x - union_damage.x).into(),
+                    (rect.y - union_damage.y).into(),
+                    rect.width.get().into(),
+                    rect.height.get().into(),
+                )
+                .unwrap();
+        }
+
+        *self.buffer_presented = true;
+
+        Ok(())
     }
 }
 

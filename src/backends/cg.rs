@@ -1,13 +1,14 @@
+//! Softbuffer implementation using CoreGraphics.
 use crate::backend_interface::*;
 use crate::error::InitError;
-use crate::{Rect, SoftBufferError};
+use crate::{util, Pixel, Rect, SoftBufferError};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool};
 use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadMarker, Message};
 use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::{
-    CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGColorSpaceCreateDeviceRGB,
-    CGDataProviderCreateWithData, CGImageAlphaInfo, CGImageCreate,
+    CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage, CGImageAlphaInfo,
+    CGImageByteOrderInfo, CGImageComponentInfo, CGImagePixelFormatInfo,
 };
 use objc2_foundation::{
     ns_string, NSDictionary, NSKeyValueChangeKey, NSKeyValueChangeNewKey,
@@ -27,7 +28,8 @@ use std::ptr::{self, slice_from_raw_parts_mut, NonNull};
 define_class!(
     #[unsafe(super(NSObject))]
     #[name = "SoftbufferObserver"]
-    #[ivars = Retained<CALayer>]
+    #[ivars = SendCALayer]
+    #[derive(Debug)]
     struct Observer;
 
     /// NSKeyValueObserving
@@ -45,13 +47,9 @@ define_class!(
     }
 );
 
-// SAFETY: The `CALayer` that the observer contains is thread safe.
-unsafe impl Send for Observer {}
-unsafe impl Sync for Observer {}
-
 impl Observer {
     fn new(layer: &CALayer) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(layer.retain());
+        let this = Self::alloc().set_ivars(SendCALayer(layer.retain()));
         unsafe { msg_send![super(this), init] }
     }
 
@@ -64,11 +62,9 @@ impl Observer {
 
         let change =
             change.expect("requested a change dictionary in `addObserver`, but none was provided");
-        let new = unsafe {
-            change
-                .objectForKey(NSKeyValueChangeNewKey)
-                .expect("requested change dictionary did not contain `NSKeyValueChangeNewKey`")
-        };
+        let new = change
+            .objectForKey(unsafe { NSKeyValueChangeNewKey })
+            .expect("requested change dictionary did not contain `NSKeyValueChangeNewKey`");
 
         // NOTE: Setting these values usually causes a quarter second animation to occur, which is
         // undesirable.
@@ -98,6 +94,7 @@ impl Observer {
     }
 }
 
+#[derive(Debug)]
 pub struct CGImpl<D, W> {
     /// Our layer.
     layer: SendCALayer,
@@ -106,7 +103,7 @@ pub struct CGImpl<D, W> {
     /// Can also be retrieved from `layer.superlayer()`.
     root_layer: SendCALayer,
     observer: Retained<Observer>,
-    color_space: SendCGColorSpace,
+    color_space: CFRetained<CGColorSpace>,
     /// The width of the underlying buffer.
     width: usize,
     /// The height of the underlying buffer.
@@ -130,7 +127,7 @@ impl<D, W> Drop for CGImpl<D, W> {
 impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for CGImpl<D, W> {
     type Context = D;
     type Buffer<'a>
-        = BufferImpl<'a, D, W>
+        = BufferImpl<'a>
     where
         Self: 'a;
 
@@ -229,7 +226,7 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for CGImpl<
         layer.setContentsGravity(unsafe { kCAGravityTopLeft });
 
         // Initialize color space here, to reduce work later on.
-        let color_space = unsafe { CGColorSpaceCreateDeviceRGB() }.unwrap();
+        let color_space = CGColorSpace::new_device_rgb().unwrap();
 
         // Grab initial width and height from the layer (whose properties have just been initialized
         // by the observer using `NSKeyValueObservingOptionInitial`).
@@ -242,7 +239,7 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for CGImpl<
             layer: SendCALayer(layer),
             root_layer: SendCALayer(root_layer),
             observer,
-            color_space: SendCGColorSpace(color_space),
+            color_space,
             width,
             height,
             _display: PhantomData,
@@ -261,27 +258,42 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> SurfaceInterface<D, W> for CGImpl<
         Ok(())
     }
 
-    fn buffer_mut(&mut self) -> Result<BufferImpl<'_, D, W>, SoftBufferError> {
+    fn buffer_mut(&mut self) -> Result<BufferImpl<'_>, SoftBufferError> {
+        let buffer_size = util::byte_stride(self.width as u32) as usize * self.height / 4;
         Ok(BufferImpl {
-            buffer: vec![0; self.width * self.height].into(),
-            imp: self,
+            buffer: util::PixelBuffer(vec![Pixel::default(); buffer_size]),
+            width: self.width,
+            height: self.height,
+            color_space: &self.color_space,
+            layer: &mut self.layer,
         })
     }
 }
 
-pub struct BufferImpl<'a, D, W> {
-    imp: &'a mut CGImpl<D, W>,
-    buffer: Box<[u32]>,
+#[derive(Debug)]
+pub struct BufferImpl<'a> {
+    width: usize,
+    height: usize,
+    color_space: &'a CGColorSpace,
+    buffer: util::PixelBuffer,
+    layer: &'a mut SendCALayer,
 }
 
-impl<D: HasDisplayHandle, W: HasWindowHandle> BufferInterface for BufferImpl<'_, D, W> {
-    #[inline]
-    fn pixels(&self) -> &[u32] {
-        &self.buffer
+impl BufferInterface for BufferImpl<'_> {
+    fn byte_stride(&self) -> NonZeroU32 {
+        NonZeroU32::new(util::byte_stride(self.width as u32)).unwrap()
+    }
+
+    fn width(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.width as u32).unwrap()
+    }
+
+    fn height(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.height as u32).unwrap()
     }
 
     #[inline]
-    fn pixels_mut(&mut self) -> &mut [u32] {
+    fn pixels_mut(&mut self) -> &mut [Pixel] {
         &mut self.buffer
     }
 
@@ -289,41 +301,51 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> BufferInterface for BufferImpl<'_,
         0
     }
 
-    fn present(self) -> Result<(), SoftBufferError> {
+    fn present_with_damage(self, _damage: &[Rect]) -> Result<(), SoftBufferError> {
         unsafe extern "C-unwind" fn release(
             _info: *mut c_void,
             data: NonNull<c_void>,
             size: usize,
         ) {
-            let data = data.cast::<u32>();
-            let slice = slice_from_raw_parts_mut(data.as_ptr(), size / size_of::<u32>());
+            let data = data.cast::<Pixel>();
+            let slice = slice_from_raw_parts_mut(data.as_ptr(), size / size_of::<Pixel>());
             // SAFETY: This is the same slice that we passed to `Box::into_raw` below.
             drop(unsafe { Box::from_raw(slice) })
         }
 
         let data_provider = {
-            let len = self.buffer.len() * size_of::<u32>();
-            let buffer: *mut [u32] = Box::into_raw(self.buffer);
+            let len = self.buffer.len() * size_of::<Pixel>();
+            let buffer: *mut [Pixel] = Box::into_raw(self.buffer.0.into_boxed_slice());
             // Convert slice pointer to thin pointer.
             let data_ptr = buffer.cast::<c_void>();
 
             // SAFETY: The data pointer and length are valid.
             // The info pointer can safely be NULL, we don't use it in the `release` callback.
             unsafe {
-                CGDataProviderCreateWithData(ptr::null_mut(), data_ptr, len, Some(release)).unwrap()
+                CGDataProvider::with_data(ptr::null_mut(), data_ptr, len, Some(release)).unwrap()
             }
         };
 
+        // `CGBitmapInfo` consists of a combination of `CGImageAlphaInfo`, `CGImageComponentInfo`
+        // `CGImageByteOrderInfo` and `CGImagePixelFormatInfo` (see e.g. `CGBitmapInfoMake`).
+        //
+        // TODO: Use `CGBitmapInfo::new` once the next version of objc2-core-graphics is released.
+        let bitmap_info = CGBitmapInfo(
+            CGImageAlphaInfo::NoneSkipFirst.0
+                | CGImageComponentInfo::Integer.0
+                | CGImageByteOrderInfo::Order32Little.0
+                | CGImagePixelFormatInfo::Packed.0,
+        );
+
         let image = unsafe {
-            CGImageCreate(
-                self.imp.width,
-                self.imp.height,
+            CGImage::new(
+                self.width,
+                self.height,
                 8,
                 32,
-                self.imp.width * 4,
-                Some(&self.imp.color_space.0),
-                // TODO: This looks incorrect!
-                CGBitmapInfo::ByteOrder32Little | CGBitmapInfo(CGImageAlphaInfo::NoneSkipFirst.0),
+                util::byte_stride(self.width as u32) as usize,
+                Some(self.color_space),
+                bitmap_info,
                 Some(&data_provider),
                 ptr::null(),
                 false,
@@ -339,27 +361,25 @@ impl<D: HasDisplayHandle, W: HasWindowHandle> BufferInterface for BufferImpl<'_,
         CATransaction::setDisableActions(true);
 
         // SAFETY: The contents is `CGImage`, which is a valid class for `contents`.
-        unsafe { self.imp.layer.setContents(Some(image.as_ref())) };
+        unsafe { self.layer.setContents(Some(image.as_ref())) };
 
         CATransaction::commit();
         Ok(())
     }
-
-    fn present_with_damage(self, _damage: &[Rect]) -> Result<(), SoftBufferError> {
-        self.present()
-    }
 }
 
-struct SendCGColorSpace(CFRetained<CGColorSpace>);
-// SAFETY: `CGColorSpace` is immutable, and can freely be shared between threads.
-unsafe impl Send for SendCGColorSpace {}
-unsafe impl Sync for SendCGColorSpace {}
-
+#[derive(Debug)]
 struct SendCALayer(Retained<CALayer>);
-// CALayer is thread safe, like most things in Core Animation, see:
+
+// SAFETY: CALayer is dubiously thread safe, like most things in Core Animation.
+// But since we make sure to do our changes within a CATransaction, it is
+// _probably_ fine for us to use CALayer from different threads.
+//
+// See also:
 // https://developer.apple.com/documentation/quartzcore/catransaction/1448267-lock?language=objc
 // https://stackoverflow.com/questions/76250226/how-to-render-content-of-calayer-on-a-background-thread
 unsafe impl Send for SendCALayer {}
+// SAFETY: Same as above.
 unsafe impl Sync for SendCALayer {}
 
 impl Deref for SendCALayer {
