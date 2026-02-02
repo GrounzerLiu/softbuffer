@@ -82,6 +82,8 @@ pub struct Surface<D, W> {
     _marker: PhantomData<Cell<()>>,
 }
 
+unsafe impl<D, W> Send for Surface<D, W> {}
+
 impl<D: HasDisplayHandle, W: HasWindowHandle> Surface<D, W> {
     /// Creates a new surface for the context for the provided window.
     pub fn new(context: &Context<D>, window: W) -> Result<Self, SoftBufferError> {

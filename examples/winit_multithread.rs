@@ -10,11 +10,12 @@ pub mod ex {
     use winit::event::{KeyEvent, WindowEvent};
     use winit::event_loop::{ControlFlow, EventLoop, OwnedDisplayHandle};
     use winit::keyboard::{Key, NamedKey};
-    use winit::window::Window;
+    use winit::window::{Window, WindowAttributes};
 
     use super::util;
 
-    type Surface = softbuffer::Surface<OwnedDisplayHandle, Arc<Window>>;
+    type Surface = softbuffer::Surface<OwnedDisplayHandle, Arc<Box<dyn Window>>>;
+
 
     fn render_thread(
         do_render: mpsc::Receiver<(Arc<Mutex<Surface>>, NonZeroU32, NonZeroU32)>,
@@ -48,12 +49,12 @@ pub mod ex {
         }
     }
 
-    pub fn entry(event_loop: EventLoop<()>) {
+    pub fn entry(event_loop: EventLoop) {
         let context = Context::new(event_loop.owned_display_handle()).unwrap();
 
         let app = util::WinitAppBuilder::with_init(
             |elwt| {
-                let attributes = Window::default_attributes();
+                let attributes = WindowAttributes::default();
                 #[cfg(target_family = "wasm")]
                 let attributes =
                     winit::platform::web::WindowAttributesExtWebSys::with_append(attributes, true);
@@ -90,7 +91,7 @@ pub mod ex {
                         return;
                     };
 
-                    let size = window.inner_size();
+                    let size = window.surface_size();
                     tracing::info!("got size: {size:?}");
                     if let (Some(width), Some(height)) =
                         (NonZeroU32::new(size.width), NonZeroU32::new(size.height))

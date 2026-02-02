@@ -2,7 +2,7 @@ use softbuffer::{Buffer, Context, Pixel, Surface};
 use std::num::NonZeroU32;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, NamedKey, SmolStr};
 
 mod util;
 
@@ -49,7 +49,7 @@ fn main() {
         }
 
         match event {
-            WindowEvent::Resized(size) => {
+            WindowEvent::SurfaceResized(size) => {
                 let Some(surface) = surface else {
                     tracing::error!("Resized fired before Resumed or after Suspended");
                     return;
@@ -89,11 +89,11 @@ fn main() {
                 event:
                     KeyEvent {
                         state: ElementState::Pressed,
-                        logical_key: Key::Named(NamedKey::Space),
+                        logical_key: Key::Character(c),
                         ..
                     },
                 ..
-            } => {
+            } if c.as_str() == " " => {
                 // Flip the rectangle flag and request a redraw to show the changed image
                 *flag = !*flag;
                 window.request_redraw();
